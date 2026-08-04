@@ -1,5 +1,9 @@
 # MiSTer Hi-Fi
 
+**Developer:** Anime0t4ku  
+**Contributor:** Phoenix
+
+
 MiSTer Hi-Fi is a controller-first music player for MiSTer FPGA.
 
 It supports local music, USB storage, SMB shares, playlists, physical Audio CDs, album artwork, a visualizer, equalizer, OLED mode, and direct launching through NFC using Zaparoo.
@@ -247,6 +251,8 @@ Physical Audio CDs are shown as `CDDA`, `16 bit`, `44.1 kHz` and `1411 kbps`.
 - **Show Album Art** enables the album-art player layout.
 - **Auto Hide Missing Art** automatically uses the full-width no-art player layout when the current track has no artwork. This option is disabled in Settings while Show Album Art is Off.
 - **Show Clock** displays the MiSTer's 24-hour system clock in the top-right corner on every MiSTer Hi-Fi screen.
+- **Confirm on Exit** asks for confirmation before closing MiSTer Hi-Fi and is enabled by default.
+- **Screensaver** can turn the display completely black after 30 seconds, 1 minute, 2 minutes, 5 minutes, or 10 minutes of inactivity. Any controller or keyboard input wakes the display and the wake input is consumed. The screensaver is Off by default.
 - **Gapless Playback (Experimental)** enables seamless natural track-to-track transitions for FLAC, WAV and physical Audio CD (CDDA) playback. MP3 is intentionally excluded. The setting is Off by default.
 - **Swap A/B** and **Swap X/Y** change physical controller behavior without changing the on-screen button labels.
 
@@ -331,6 +337,8 @@ MiSTer Hi-Fi is released under the **GNU General Public License v3.0**.
 The GPLv3 license applies to MiSTer Hi-Fi's own source code and does not replace the separate license terms of third-party software such as miniaudio.
 
 ## Known Issues
+
+- Special characters in file or track names are not fully supported yet and may prevent affected tracks from playing. This will be addressed in a future update.
 
 - Zaparoo's **HOLD** mode is currently not compatible with MiSTer Hi-Fi.
 - While MiSTer Hi-Fi is active, Zaparoo cannot process another NFC scan.

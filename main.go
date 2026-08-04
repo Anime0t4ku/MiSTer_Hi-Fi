@@ -28,7 +28,7 @@ import (
 	"unsafe"
 )
 
-const version = "0.9.0"
+const version = "1.0.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -37,6 +37,8 @@ var supported = map[string]bool{".mp3": true, ".wav": true, ".flac": true, ".m3u
 
 var swapABInput atomic.Bool
 var swapXYInput atomic.Bool
+var screenSaverSeconds atomic.Int64
+var screenSaverActive atomic.Bool
 
 type Config struct {
 	EQ                 EQConfig `json:"eq"`
@@ -45,6 +47,8 @@ type Config struct {
 	HideAlbumArt       bool     `json:"hide_album_art"`
 	AutoHideMissingArt bool     `json:"auto_hide_missing_art"`
 	ShowClock          bool     `json:"show_clock"`
+	ConfirmOnExit      bool     `json:"confirm_on_exit"`
+	ScreenSaverSeconds int      `json:"screensaver_seconds"`
 	GaplessPlayback    bool     `json:"gapless_playback"`
 	SwapAB             bool     `json:"swap_ab"`
 	SwapXY             bool     `json:"swap_xy"`
@@ -106,6 +110,7 @@ const (
 	actStop
 	actNowPlaying
 	actSources
+	actWake
 )
 const (
 	evKey    = 1
@@ -240,6 +245,9 @@ func (fb *framebuffer) border(x, y, w, h, t int, c color.RGBA) {
 }
 func (fb *framebuffer) fill(c color.RGBA) { fb.rect(0, 0, fb.w, fb.h, c) }
 func (fb *framebuffer) present() {
+	if screenSaverActive.Load() {
+		return
+	}
 	if fb == nil || len(fb.back) == 0 || len(fb.data) == 0 {
 		return
 	}
@@ -253,6 +261,9 @@ func (fb *framebuffer) present() {
 	copy(fb.data[:n], fb.back[:n])
 }
 func (fb *framebuffer) presentRegion(x, y, w, h int) {
+	if screenSaverActive.Load() {
+		return
+	}
 	if fb == nil || w <= 0 || h <= 0 {
 		return
 	}
@@ -327,6 +338,47 @@ func (fb *framebuffer) drawImage(im image.Image, dx, dy, dw, dh int) {
 		for x := 0; x < w; x++ {
 			sx := b.Min.X + x*sw/w
 			fb.put(ox+x, oy+y, sample(im, sx, sy))
+		}
+	}
+}
+
+func screenSaverInputLoop(fb *framebuffer, raw <-chan action, out chan<- action, done <-chan struct{}) {
+	lastActivity := time.Now()
+	sleeping := false
+	tick := time.NewTicker(250 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case a := <-raw:
+			lastActivity = time.Now()
+			if sleeping {
+				sleeping = false
+				screenSaverActive.Store(false)
+				select {
+				case out <- actWake:
+				case <-done:
+					return
+				}
+				continue
+			}
+			select {
+			case out <- a:
+			case <-done:
+				return
+			}
+		case now := <-tick.C:
+			seconds := screenSaverSeconds.Load()
+			if seconds <= 0 {
+				continue
+			}
+			if !sleeping && now.Sub(lastActivity) >= time.Duration(seconds)*time.Second {
+				fb.fill(color.RGBA{0, 0, 0, 255})
+				fb.present()
+				screenSaverActive.Store(true)
+				sleeping = true
+			}
 		}
 	}
 }
@@ -493,7 +545,7 @@ func (t *termState) restore() {
 }
 
 func defaultConfig() Config {
-	return Config{Visualizer: "bars"}
+	return Config{Visualizer: "bars", ConfirmOnExit: true}
 }
 func loadConfig() Config {
 	c := defaultConfig()
@@ -504,12 +556,23 @@ func loadConfig() Config {
 		saveConfig(c)
 		return c
 	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		backup := path + ".invalid-" + time.Now().Format("20060102-150405")
+		_ = os.Rename(path, backup)
+		c = defaultConfig()
+		saveConfig(c)
+		return c
+	}
 	if err := json.Unmarshal(b, &c); err != nil {
 		backup := path + ".invalid-" + time.Now().Format("20060102-150405")
 		_ = os.Rename(path, backup)
 		c = defaultConfig()
 		saveConfig(c)
 		return c
+	}
+	if _, ok := raw["confirm_on_exit"]; !ok {
+		c.ConfirmOnExit = true
 	}
 	if c.Visualizer == "" {
 		c.Visualizer = "bars"
@@ -2680,6 +2743,8 @@ func playerUI(app *App) {
 			redrawControls := false
 			fullRedraw := false
 			switch a {
+			case actWake:
+				fullRedraw = true
 			case actUp:
 				if sel != 0 {
 					sel = 0
@@ -3063,12 +3128,90 @@ func runBrowserSource(app *App, root, kind string) {
 	}
 }
 
+var screenSaverOptions = []int{0, 30, 60, 120, 300, 600}
+
+func screenSaverLabel(seconds int) string {
+	switch seconds {
+	case 30:
+		return "30 SECONDS"
+	case 60:
+		return "1 MINUTE"
+	case 120:
+		return "2 MINUTES"
+	case 300:
+		return "5 MINUTES"
+	case 600:
+		return "10 MINUTES"
+	default:
+		return "OFF"
+	}
+}
+
+func cycleScreenSaver(current, dir int) int {
+	idx := 0
+	for i, v := range screenSaverOptions {
+		if v == current {
+			idx = i
+			break
+		}
+	}
+	idx += dir
+	if idx < 0 {
+		idx = len(screenSaverOptions) - 1
+	}
+	if idx >= len(screenSaverOptions) {
+		idx = 0
+	}
+	return screenSaverOptions[idx]
+}
+
+func confirmExitUI(app *App) bool {
+	fb, acts := app.fb, app.acts
+	for {
+		bg := appBackground(app.cfg)
+		fb.fill(bg)
+		drawTitle(fb, "EXIT MISTER HI-FI?")
+		scale := max(1, fb.h/180)
+		msg := "A  EXIT     B  CANCEL"
+		x := (fb.w - tw(scale, msg)) / 2
+		y := fb.h/2 - scale*4
+		fb.text(x, y, scale, msg, color.RGBA{240, 240, 240, 255})
+		drawClock(fb, app.cfg, bg)
+		fb.present()
+
+		select {
+		case a := <-acts:
+			switch a {
+			case actConfirm:
+				return true
+			case actBack, actSources, actWake:
+				return false
+			}
+		case raw := <-app.external:
+			if err := app.startExternal(raw); err == nil {
+				playerUI(app)
+				return false
+			}
+		}
+	}
+}
+
 func settingsUI(app *App) {
 	fb, acts, cfg := app.fb, app.acts, app.cfg
 	clockTick := time.NewTicker(30 * time.Second)
 	defer clockTick.Stop()
 	sel := 0
-	labels := []string{"OLED MODE", "SHOW ALBUM ART", "AUTO HIDE MISSING ART", "SHOW CLOCK", "GAPLESS PLAYBACK (EXPERIMENTAL)", "SWAP A/B", "SWAP X/Y"}
+	labels := []string{
+		"OLED MODE",
+		"SHOW ALBUM ART",
+		"AUTO HIDE MISSING ART",
+		"SHOW CLOCK",
+		"CONFIRM ON EXIT",
+		"SCREENSAVER",
+		"GAPLESS PLAYBACK (EXPERIMENTAL)",
+		"SWAP A/B",
+		"SWAP X/Y",
+	}
 	enabled := func(i int) bool {
 		return i != 2 || !cfg.HideAlbumArt
 	}
@@ -3090,13 +3233,19 @@ func settingsUI(app *App) {
 		}
 		fb.fill(appBackground(cfg))
 		drawTitle(fb, "SETTINGS")
-		row := max(34, fb.h/10)
-		y0 := 82
+		y0 := max(66, fb.h/15)
+		bottomReserve := max(82, fb.h/11)
+		row := (fb.h - y0 - bottomReserve) / len(labels)
+		if row < 34 {
+			row = 34
+		}
 		values := []string{
 			onoff(cfg.OLEDMode),
 			onoff(!cfg.HideAlbumArt),
 			onoff(cfg.AutoHideMissingArt),
 			onoff(cfg.ShowClock),
+			onoff(cfg.ConfirmOnExit),
+			screenSaverLabel(cfg.ScreenSaverSeconds),
 			onoff(cfg.GaplessPlayback),
 			onoff(cfg.SwapAB),
 			onoff(cfg.SwapXY),
@@ -3106,29 +3255,37 @@ func settingsUI(app *App) {
 			y := y0 + i*row
 			rowEnabled := enabled(i)
 			if sel == i && rowEnabled {
-				fb.rect(45, y-5, fb.w-90, row-5, color.RGBA{35, 37, 46, 255})
-				fb.border(45, y-5, fb.w-90, row-5, 2, color.RGBA{240, 240, 240, 255})
+				fb.rect(45, y-4, fb.w-90, row-3, color.RGBA{35, 37, 46, 255})
+				fb.border(45, y-4, fb.w-90, row-3, 2, color.RGBA{240, 240, 240, 255})
 			}
 			labelColor := color.RGBA{235, 235, 235, 255}
 			valueColor := color.RGBA{200, 200, 205, 255}
+			subColor := color.RGBA{125, 125, 132, 255}
 			if !rowEnabled {
 				labelColor = color.RGBA{90, 90, 96, 255}
 				valueColor = color.RGBA{75, 75, 82, 255}
+				subColor = color.RGBA{70, 70, 76, 255}
 			}
-			labelY := y + 6
-			if i == 4 {
-				labelY = y + 2
+			hasSub := i == 5 || i == 6
+			labelY := y + 5
+			if hasSub {
+				labelY = y + 1
 			}
 			fb.text(65, labelY, ts, labels[i], labelColor)
-			if i == 4 {
+			if i == 5 {
 				subScale := max(1, ts-1)
-				fb.text(65, labelY+ts*8, subScale, "FLAC / WAV / CDDA ONLY", color.RGBA{125, 125, 132, 255})
+				fb.text(65, labelY+ts*8, subScale, "TURNS THE DISPLAY COMPLETELY BLACK WHILE INACTIVE", subColor)
 			}
-			fb.text(fb.w-65-tw(ts, values[i]), y+6, ts, values[i], valueColor)
+			if i == 6 {
+				subScale := max(1, ts-1)
+				fb.text(65, labelY+ts*8, subScale, "FLAC / WAV / CDDA ONLY", subColor)
+			}
+			fb.text(fb.w-65-tw(ts, values[i]), y+5, ts, values[i], valueColor)
 		}
 		drawBrowserFooter(fb, false)
 		drawClock(fb, cfg, appBackground(cfg))
 		fb.present()
+
 		var a action
 		select {
 		case <-clockTick.C:
@@ -3140,6 +3297,9 @@ func settingsUI(app *App) {
 				app.jumpSources = true
 				return
 			}
+			continue
+		}
+		if a == actWake {
 			continue
 		}
 		if app.handlePlaybackShortcut(a) {
@@ -3171,6 +3331,15 @@ func settingsUI(app *App) {
 			case 3:
 				cfg.ShowClock = !cfg.ShowClock
 			case 4:
+				cfg.ConfirmOnExit = !cfg.ConfirmOnExit
+			case 5:
+				dir := 1
+				if a == actLeft {
+					dir = -1
+				}
+				cfg.ScreenSaverSeconds = cycleScreenSaver(cfg.ScreenSaverSeconds, dir)
+				screenSaverSeconds.Store(int64(cfg.ScreenSaverSeconds))
+			case 6:
 				cfg.GaplessPlayback = !cfg.GaplessPlayback
 				if app.player != nil {
 					app.player.mu.Lock()
@@ -3180,10 +3349,10 @@ func settingsUI(app *App) {
 						app.player.prepareGaplessNextFile()
 					}
 				}
-			case 5:
+			case 7:
 				cfg.SwapAB = !cfg.SwapAB
 				swapABInput.Store(cfg.SwapAB)
-			case 6:
+			case 8:
 				cfg.SwapXY = !cfg.SwapXY
 				swapXYInput.Store(cfg.SwapXY)
 			}
@@ -3280,6 +3449,9 @@ func sourcesUI(app *App) {
 		if !ok {
 			if app.jumpSources {
 				app.jumpSources = false
+				continue
+			}
+			if app.cfg.ConfirmOnExit && !confirmExitUI(app) {
 				continue
 			}
 			return
@@ -3384,8 +3556,11 @@ func main() {
 	swapABInput.Store(cfg.SwapAB)
 	swapXYInput.Store(cfg.SwapXY)
 	done := make(chan struct{})
+	rawActs := make(chan action, 8)
 	acts := make(chan action, 8)
-	inputLoop(acts, done)
+	screenSaverSeconds.Store(int64(cfg.ScreenSaverSeconds))
+	inputLoop(rawActs, done)
+	go screenSaverInputLoop(fb, rawActs, acts, done)
 	defer close(done)
 	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg}
 	defer cleanupSMBMounts()
