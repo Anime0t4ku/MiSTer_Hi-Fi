@@ -40,6 +40,24 @@ func nativeAudioStartPCM(eq EQConfig) error {
 	return nil
 }
 
+func nativeAudioQueueNextFile(path string) error {
+	cp := C.CString(path)
+	defer C.free(unsafe.Pointer(cp))
+	if C.mh_audio_queue_next_file(cp) != 0 {
+		return errors.New("unable to queue gapless track")
+	}
+	return nil
+}
+
+func nativeAudioMarkPCMTransition(nextDuration float64) error {
+	if C.mh_audio_mark_pcm_transition(C.double(nextDuration)) != 0 {
+		return errors.New("unable to queue gapless CD transition")
+	}
+	return nil
+}
+
+func nativeAudioTakeTransition() bool { return C.mh_audio_take_transition() != 0 }
+
 func nativeAudioWritePCM(b []byte) error {
 	if len(b) == 0 {
 		return nil

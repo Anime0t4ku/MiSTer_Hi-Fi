@@ -28,7 +28,7 @@ import (
 	"unsafe"
 )
 
-const version = "0.4.1"
+const version = "0.9.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -39,11 +39,15 @@ var swapABInput atomic.Bool
 var swapXYInput atomic.Bool
 
 type Config struct {
-	EQ         EQConfig `json:"eq"`
-	Visualizer string   `json:"visualizer"`
-	OLEDMode   bool     `json:"oled_mode"`
-	SwapAB     bool     `json:"swap_ab"`
-	SwapXY     bool     `json:"swap_xy"`
+	EQ                 EQConfig `json:"eq"`
+	Visualizer         string   `json:"visualizer"`
+	OLEDMode           bool     `json:"oled_mode"`
+	HideAlbumArt       bool     `json:"hide_album_art"`
+	AutoHideMissingArt bool     `json:"auto_hide_missing_art"`
+	ShowClock          bool     `json:"show_clock"`
+	GaplessPlayback    bool     `json:"gapless_playback"`
+	SwapAB             bool     `json:"swap_ab"`
+	SwapXY             bool     `json:"swap_xy"`
 }
 type EQConfig struct {
 	Enabled                            bool `json:"enabled"`
@@ -57,9 +61,11 @@ type SMBShare struct {
 	Guest                                         bool
 }
 type Track struct {
-	Path, Title, Artist, Album string
-	Duration                   float64
-	Art                        image.Image
+	Path, Title, Artist, Album    string
+	Duration                      float64
+	MediaFormat                   string
+	BitDepth, SampleRate, BitRate int
+	Art                           image.Image
 }
 type Queue struct {
 	Tracks          []Track
@@ -735,12 +741,134 @@ func trackFromPath(p string) Track {
 }
 func readBasicTags(t *Track) {
 	ext := strings.ToLower(filepath.Ext(t.Path))
-	if ext == ".mp3" {
+	switch ext {
+	case ".mp3":
+		t.MediaFormat = "MP3"
+		readMP3Info(t)
 		readID3(t)
-	} else if ext == ".flac" {
+	case ".flac":
+		t.MediaFormat = "FLAC"
 		readFLAC(t)
+	case ".wav":
+		t.MediaFormat = "WAV"
+		readWAVInfo(t)
 	}
 }
+func syncSafeSize(b []byte) int {
+	if len(b) < 4 {
+		return 0
+	}
+	return int(b[0]&0x7f)<<21 | int(b[1]&0x7f)<<14 | int(b[2]&0x7f)<<7 | int(b[3]&0x7f)
+}
+
+func readMP3Info(t *Track) {
+	f, e := os.Open(t.Path)
+	if e != nil {
+		return
+	}
+	defer f.Close()
+	var offset int64
+	h := make([]byte, 10)
+	if _, e = io.ReadFull(f, h); e == nil && string(h[:3]) == "ID3" {
+		offset = int64(10 + syncSafeSize(h[6:10]))
+		if h[5]&0x10 != 0 {
+			offset += 10
+		}
+	}
+	if _, e = f.Seek(offset, io.SeekStart); e != nil {
+		return
+	}
+	buf := make([]byte, 64*1024)
+	n, _ := f.Read(buf)
+	buf = buf[:n]
+	bitratesMPEG1L3 := [...]int{0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0}
+	bitratesMPEG2L3 := [...]int{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}
+	sampleRates := [...]int{44100, 48000, 32000}
+	for i := 0; i+4 <= len(buf); i++ {
+		v := binary.BigEndian.Uint32(buf[i : i+4])
+		if v&0xffe00000 != 0xffe00000 {
+			continue
+		}
+		versionID := int((v >> 19) & 0x3)
+		layer := int((v >> 17) & 0x3)
+		bitrateIndex := int((v >> 12) & 0xf)
+		sampleIndex := int((v >> 10) & 0x3)
+		if versionID == 1 || layer != 1 || bitrateIndex == 0 || bitrateIndex == 15 || sampleIndex == 3 {
+			continue
+		}
+		rate := sampleRates[sampleIndex]
+		switch versionID {
+		case 2:
+			rate /= 2
+		case 0:
+			rate /= 4
+		}
+		t.SampleRate = rate
+		if versionID == 3 {
+			t.BitRate = bitratesMPEG1L3[bitrateIndex]
+		} else {
+			t.BitRate = bitratesMPEG2L3[bitrateIndex]
+		}
+		return
+	}
+}
+
+func readWAVInfo(t *Track) {
+	f, e := os.Open(t.Path)
+	if e != nil {
+		return
+	}
+	defer f.Close()
+	h := make([]byte, 12)
+	if _, e = io.ReadFull(f, h); e != nil || string(h[:4]) != "RIFF" || string(h[8:12]) != "WAVE" {
+		return
+	}
+	var channels, byteRate, dataSize int
+	for {
+		ch := make([]byte, 8)
+		if _, e = io.ReadFull(f, ch); e != nil {
+			break
+		}
+		n := int(binary.LittleEndian.Uint32(ch[4:8]))
+		if n < 0 {
+			break
+		}
+		switch string(ch[:4]) {
+		case "fmt ":
+			b := make([]byte, n)
+			if _, e = io.ReadFull(f, b); e != nil {
+				return
+			}
+			if len(b) >= 16 {
+				channels = int(binary.LittleEndian.Uint16(b[2:4]))
+				t.SampleRate = int(binary.LittleEndian.Uint32(b[4:8]))
+				byteRate = int(binary.LittleEndian.Uint32(b[8:12]))
+				t.BitDepth = int(binary.LittleEndian.Uint16(b[14:16]))
+			}
+		case "data":
+			dataSize = n
+			if _, e = f.Seek(int64(n+(n&1)), io.SeekCurrent); e != nil {
+				return
+			}
+		default:
+			if _, e = f.Seek(int64(n+(n&1)), io.SeekCurrent); e != nil {
+				return
+			}
+		}
+		if t.SampleRate > 0 && t.BitDepth > 0 && dataSize > 0 {
+			break
+		}
+	}
+	if byteRate > 0 {
+		t.BitRate = byteRate * 8 / 1000
+		if dataSize > 0 {
+			t.Duration = float64(dataSize) / float64(byteRate)
+		}
+	} else if channels > 0 && t.SampleRate > 0 && t.BitDepth > 0 {
+		t.BitRate = channels * t.SampleRate * t.BitDepth / 1000
+	}
+}
+
 func readID3(t *Track) {
 	f, e := os.Open(t.Path)
 	if e != nil {
@@ -814,6 +942,18 @@ func readFLAC(t *Track) {
 		b := make([]byte, n)
 		if _, e = io.ReadFull(f, b); e != nil {
 			return
+		}
+		if typ == 0 && len(b) >= 34 {
+			x := binary.BigEndian.Uint64(b[10:18])
+			t.SampleRate = int((x >> 44) & 0xfffff)
+			t.BitDepth = int((x>>36)&0x1f) + 1
+			totalSamples := x & 0xfffffffff
+			if t.SampleRate > 0 && totalSamples > 0 {
+				t.Duration = float64(totalSamples) / float64(t.SampleRate)
+				if st, err := os.Stat(t.Path); err == nil && t.Duration > 0 {
+					t.BitRate = int((float64(st.Size()) * 8 / t.Duration / 1000) + 0.5)
+				}
+			}
 		}
 		if typ == 4 {
 			parseVorbis(t, b)
@@ -1089,17 +1229,20 @@ func externalListener(ch chan<- string) (net.Listener, error) {
 }
 
 type Player struct {
-	mu           sync.Mutex
-	q            Queue
-	paused       bool
-	stopped      bool
-	stop         chan struct{}
-	levels       [10]float64
-	basePosition float64
-	cfg          Config
+	mu                 sync.Mutex
+	q                  Queue
+	paused             bool
+	stopped            bool
+	stop               chan struct{}
+	levels             [10]float64
+	basePosition       float64
+	cfg                Config
+	gaplessQueuedIndex int
 }
 
-func newPlayer(q Queue, cfg Config) *Player { return &Player{q: q, cfg: cfg, stopped: true} }
+func newPlayer(q Queue, cfg Config) *Player {
+	return &Player{q: q, cfg: cfg, stopped: true, gaplessQueuedIndex: -1}
+}
 func (p *Player) loadCurrentMetadata(index int, path string) {
 	if strings.HasPrefix(path, "cdda:") {
 		return
@@ -1122,6 +1265,85 @@ func (p *Player) current() *Track {
 	t := p.q.Tracks[p.q.Index]
 	return &t
 }
+func gaplessTrackSupported(t Track) bool {
+	if strings.HasPrefix(t.Path, "cdda:") {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(t.Path)) {
+	case ".flac", ".wav":
+		return true
+	}
+	return false
+}
+
+func (p *Player) nextQueueIndexLocked(from int) int {
+	if len(p.q.Tracks) == 0 || from < 0 || from >= len(p.q.Tracks) {
+		return -1
+	}
+	if p.q.Repeat {
+		return from
+	}
+	if p.q.Shuffle {
+		return -1
+	}
+	if from+1 < len(p.q.Tracks) {
+		return from + 1
+	}
+	return -1
+}
+
+func (p *Player) prepareGaplessNextFile() {
+	p.mu.Lock()
+	if !p.cfg.GaplessPlayback || p.stopped || p.q.Index < 0 || p.q.Index >= len(p.q.Tracks) {
+		p.gaplessQueuedIndex = -1
+		p.mu.Unlock()
+		return
+	}
+	current := p.q.Tracks[p.q.Index]
+	nextIndex := p.nextQueueIndexLocked(p.q.Index)
+	if nextIndex < 0 || nextIndex >= len(p.q.Tracks) {
+		p.gaplessQueuedIndex = -1
+		p.mu.Unlock()
+		return
+	}
+	next := p.q.Tracks[nextIndex]
+	if strings.HasPrefix(current.Path, "cdda:") || strings.HasPrefix(next.Path, "cdda:") ||
+		!gaplessTrackSupported(current) || !gaplessTrackSupported(next) {
+		p.gaplessQueuedIndex = -1
+		p.mu.Unlock()
+		return
+	}
+	p.gaplessQueuedIndex = nextIndex
+	p.mu.Unlock()
+	if err := nativeAudioQueueNextFile(next.Path); err != nil {
+		p.mu.Lock()
+		if p.gaplessQueuedIndex == nextIndex {
+			p.gaplessQueuedIndex = -1
+		}
+		p.mu.Unlock()
+	}
+}
+
+func (p *Player) handleGaplessTransition() {
+	p.mu.Lock()
+	nextIndex := p.gaplessQueuedIndex
+	if nextIndex < 0 || nextIndex >= len(p.q.Tracks) {
+		p.mu.Unlock()
+		return
+	}
+	p.q.Index = nextIndex
+	t := p.q.Tracks[nextIndex]
+	p.gaplessQueuedIndex = -1
+	p.basePosition = 0
+	p.paused = false
+	p.stopped = false
+	p.mu.Unlock()
+	if !strings.HasPrefix(t.Path, "cdda:") {
+		p.loadCurrentMetadata(nextIndex, t.Path)
+		p.prepareGaplessNextFile()
+	}
+}
+
 func (p *Player) playCurrent() error {
 	p.stopPlaybackRaw()
 	p.mu.Lock()
@@ -1137,6 +1359,7 @@ func (p *Player) playCurrent() error {
 	p.paused = false
 	p.stopped = false
 	p.basePosition = 0
+	p.gaplessQueuedIndex = -1
 	p.mu.Unlock()
 	var err error
 	if strings.HasPrefix(t.Path, "cdda:") {
@@ -1156,6 +1379,9 @@ func (p *Player) playCurrent() error {
 		p.mu.Unlock()
 		return err
 	}
+	if !strings.HasPrefix(t.Path, "cdda:") {
+		p.prepareGaplessNextFile()
+	}
 	go p.monitorPlayback(stop)
 	return nil
 }
@@ -1171,6 +1397,9 @@ func (p *Player) monitorPlayback(stop <-chan struct{}) {
 			p.mu.Lock()
 			p.levels = lv
 			p.mu.Unlock()
+			if nativeAudioTakeTransition() {
+				p.handleGaplessTransition()
+			}
 			if nativeAudioEnded() {
 				p.advance()
 				return
@@ -1206,6 +1435,8 @@ func (p *Player) playCDTrack(t Track, stop <-chan struct{}) error {
 	}
 	p.mu.Lock()
 	offset := p.basePosition
+	startIndex := p.q.Index
+	gapless := p.cfg.GaplessPlayback
 	p.mu.Unlock()
 	if offset > 0 {
 		start += int32(offset * 75.0)
@@ -1223,34 +1454,81 @@ func (p *Player) playCDTrack(t Track, stop <-chan struct{}) error {
 	}
 	go func() {
 		defer f.Close()
-		lba := start
+		currentIndex := startIndex
+		currentDev := dev
+		currentStart := start
+		currentEnd := end
 		buf := make([]byte, cdFrameBytes*16)
-		for lba < end {
-			select {
-			case <-stop:
-				return
-			default:
+		for {
+			lba := currentStart
+			for lba < currentEnd {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				nf := int32(16)
+				if lba+nf > currentEnd {
+					nf = currentEnd - lba
+				}
+				n := int(nf) * cdFrameBytes
+				r := cdReadAudio{Addr: lba, AddrFormat: cdromLBAMode, Frames: nf, Buf: uintptr(unsafe.Pointer(&buf[0]))}
+				if err := cdIoctl(f.Fd(), cdromReadAudio, unsafe.Pointer(&r)); err != nil {
+					nativeAudioFinishPCM()
+					return
+				}
+				if err := nativeAudioWritePCM(buf[:n]); err != nil {
+					nativeAudioFinishPCM()
+					return
+				}
+				lba += nf
 			}
-			nf := int32(16)
-			if lba+nf > end {
-				nf = end - lba
-			}
-			n := int(nf) * cdFrameBytes
-			r := cdReadAudio{Addr: lba, AddrFormat: cdromLBAMode, Frames: nf, Buf: uintptr(unsafe.Pointer(&buf[0]))}
-			if err := cdIoctl(f.Fd(), cdromReadAudio, unsafe.Pointer(&r)); err != nil {
+
+			if !gapless {
 				nativeAudioFinishPCM()
 				return
 			}
-			if err := nativeAudioWritePCM(buf[:n]); err != nil {
+
+			p.mu.Lock()
+			nextIndex := p.nextQueueIndexLocked(currentIndex)
+			if nextIndex < 0 || nextIndex >= len(p.q.Tracks) || !gaplessTrackSupported(p.q.Tracks[nextIndex]) ||
+				!strings.HasPrefix(p.q.Tracks[nextIndex].Path, "cdda:") {
+				p.gaplessQueuedIndex = -1
+				p.mu.Unlock()
 				nativeAudioFinishPCM()
 				return
 			}
-			lba += nf
+			nextTrack := p.q.Tracks[nextIndex]
+			p.gaplessQueuedIndex = nextIndex
+			p.mu.Unlock()
+
+			nextDev, nextStart, nextEnd, err := parseCDDAPath(nextTrack.Path)
+			if err != nil || nextDev != currentDev {
+				p.mu.Lock()
+				if p.gaplessQueuedIndex == nextIndex {
+					p.gaplessQueuedIndex = -1
+				}
+				p.mu.Unlock()
+				nativeAudioFinishPCM()
+				return
+			}
+			if err := nativeAudioMarkPCMTransition(nextTrack.Duration); err != nil {
+				p.mu.Lock()
+				if p.gaplessQueuedIndex == nextIndex {
+					p.gaplessQueuedIndex = -1
+				}
+				p.mu.Unlock()
+				nativeAudioFinishPCM()
+				return
+			}
+			currentIndex = nextIndex
+			currentStart = nextStart
+			currentEnd = nextEnd
 		}
-		nativeAudioFinishPCM()
 	}()
 	return nil
 }
+
 func (p *Player) stopPlaybackRaw() {
 	p.mu.Lock()
 	if p.stop != nil {
@@ -1271,7 +1549,24 @@ func (p *Player) stopAndReset() {
 	p.stopped = true
 	p.basePosition = 0
 	p.levels = [10]float64{}
+	p.gaplessQueuedIndex = -1
 	p.mu.Unlock()
+}
+func (a *App) stopAndUnload() {
+	if a.player == nil {
+		return
+	}
+	if a.origin != nil {
+		if t := a.player.current(); t != nil {
+			if a.origin.Kind == "disc" {
+				a.origin.Selected = t.Title
+			} else if !strings.HasPrefix(t.Path, "cdda:") && filepath.Clean(filepath.Dir(t.Path)) == filepath.Clean(a.origin.Dir) {
+				a.origin.Selected = filepath.Base(t.Path)
+			}
+		}
+	}
+	a.player.stopAndReset()
+	a.player = nil
 }
 func (p *Player) advance() {
 	p.mu.Lock()
@@ -1421,6 +1716,36 @@ func playerBackground(cfg *Config) color.RGBA {
 	return color.RGBA{7, 8, 11, 255}
 }
 
+func effectiveHideAlbumArt(t Track, cfg *Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.HideAlbumArt || (cfg.AutoHideMissingArt && t.Art == nil)
+}
+
+func clockText(cfg *Config) string {
+	if cfg == nil || !cfg.ShowClock {
+		return ""
+	}
+	return time.Now().Format("15:04")
+}
+
+func drawClock(fb *framebuffer, cfg *Config, bg color.RGBA) (int, int, int, int) {
+	txt := clockText(cfg)
+	scale := max(1, fb.h/360)
+	margin := max(18, fb.w/64)
+	pad := max(8, scale*4)
+	h := scale*7 + pad*2
+	w := tw(scale, "88:88") + pad*2
+	x := fb.w - margin - w
+	y := max(10, fb.h/54)
+	fb.rect(x, y, w, h, bg)
+	if txt != "" {
+		fb.text(x+w-pad-tw(scale, txt), y+pad, scale, txt, color.RGBA{245, 245, 245, 255})
+	}
+	return x, y, w, h
+}
+
 func (a *App) startQueue(q Queue, origin *browseOrigin) error {
 	if a.player != nil {
 		a.player.stopPlaybackRaw()
@@ -1483,7 +1808,7 @@ func (a *App) handlePlaybackShortcut(act action) bool {
 		a.player.togglePause()
 		return true
 	case actStop:
-		a.player.stopAndReset()
+		a.stopAndUnload()
 		return true
 	}
 	return false
@@ -1629,6 +1954,8 @@ func drawNowPlayingBar(app *App, selected bool) int {
 
 func menu(app *App, title string, items []string, initial int) (int, bool) {
 	fb, acts := app.fb, app.acts
+	clockTick := time.NewTicker(30 * time.Second)
+	defer clockTick.Stop()
 	sel := initial
 	if sel < 0 || sel >= len(items) {
 		sel = 0
@@ -1685,9 +2012,12 @@ func menu(app *App, title string, items []string, initial int) (int, bool) {
 			drawNowPlayingBar(app, barSel)
 		}
 		drawBrowserFooter(fb, true)
+		drawClock(fb, app.cfg, appBackground(app.cfg))
 		fb.present()
 		var a action
 		select {
+		case <-clockTick.C:
+			continue
 		case a = <-acts:
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
@@ -1917,7 +2247,7 @@ type playerLayout struct {
 	scale                float64
 }
 
-func makePlayerLayout(fb *framebuffer, t Track) playerLayout {
+func makePlayerLayout(fb *framebuffer, t Track, cfg *Config) playerLayout {
 	scale := playerScale(fb)
 	margin := scaledPx(scale, 60)
 	top := scaledPx(scale, 115)
@@ -1937,7 +2267,11 @@ func makePlayerLayout(fb *framebuffer, t Track) playerLayout {
 	}
 	rightX := margin + artSize + gapPanels
 	rightW := fb.w - rightX - margin
-	if rightW < scaledPx(scale, 520) {
+	if effectiveHideAlbumArt(t, cfg) {
+		artSize = 0
+		rightX = margin
+		rightW = fb.w - margin*2
+	} else if rightW < scaledPx(scale, 520) {
 		rightX = fb.w * 38 / 100
 		rightW = fb.w - rightX - margin
 		artSize = rightX - margin - gapPanels
@@ -1945,7 +2279,6 @@ func makePlayerLayout(fb *framebuffer, t Track) playerLayout {
 			artSize = maxArtH
 		}
 	}
-	bodyScale := scaledFont(scale, 3)
 	metaGap := scaledPx(scale, 52)
 	bodyGap := scaledPx(scale, 36)
 	metaY := top + metaGap
@@ -1955,6 +2288,7 @@ func makePlayerLayout(fb *framebuffer, t Track) playerLayout {
 	if t.Album != "" {
 		metaY += bodyGap
 	}
+	metaY += bodyGap
 	vizY := top + scaledPx(scale, 155)
 	if metaY+scaledPx(scale, 22) > vizY {
 		vizY = metaY + scaledPx(scale, 22)
@@ -1972,7 +2306,6 @@ func makePlayerLayout(fb *framebuffer, t Track) playerLayout {
 	barY := timeY + scaledPx(scale, 48)
 	barH := scaledPx(scale, 5)
 	ctrlY := fb.h - scaledPx(scale, 145)
-	_ = bodyScale
 	return playerLayout{margin: margin, top: top, artSize: artSize, rightX: rightX, rightW: rightW, vizY: vizY, vizH: vizH, timeY: timeY, barY: barY, barH: barH, ctrlY: ctrlY, scale: scale}
 }
 
@@ -2105,6 +2438,56 @@ func drawEQIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
 	}
 }
 
+func formatSampleRate(rate int) string {
+	if rate <= 0 {
+		return ""
+	}
+	if rate%1000 == 0 {
+		return fmt.Sprintf("%d kHz", rate/1000)
+	}
+	return fmt.Sprintf("%.1f kHz", float64(rate)/1000)
+}
+
+func audioInfoBadges(t Track) []string {
+	out := make([]string, 0, 4)
+	if t.MediaFormat != "" {
+		out = append(out, t.MediaFormat)
+	}
+	if t.BitDepth > 0 {
+		out = append(out, fmt.Sprintf("%d bit", t.BitDepth))
+	}
+	if t.SampleRate > 0 {
+		out = append(out, formatSampleRate(t.SampleRate))
+	}
+	if t.BitRate > 0 {
+		out = append(out, fmt.Sprintf("%d kbps", t.BitRate))
+	}
+	return out
+}
+
+func drawInfoBadges(fb *framebuffer, x, y, maxW, lineScale int, t Track, cfg *Config) {
+	items := audioInfoBadges(t)
+	if len(items) == 0 || maxW <= 0 {
+		return
+	}
+	fontScale := max(1, lineScale-1)
+	gap := max(2, lineScale*3)
+	padX := max(3, lineScale*3)
+	blockH := max(8, lineScale*7)
+	textY := y + (blockH-fontScale*7)/2
+	bgText := playerBackground(cfg)
+	white := color.RGBA{255, 255, 255, 255}
+	for _, item := range items {
+		w := tw(fontScale, item) + padX*2
+		if x+w > maxW {
+			break
+		}
+		fb.rect(x, y, w, blockH, white)
+		fb.text(x+padX, textY, fontScale, item, bgText)
+		x += w + gap
+	}
+}
+
 func drawPlayerStatic(fb *framebuffer, p *Player, sel int, cfg *Config) playerLayout {
 	bg := playerBackground(cfg)
 	fb.fill(bg)
@@ -2112,14 +2495,16 @@ func drawPlayerStatic(fb *framebuffer, p *Player, sel int, cfg *Config) playerLa
 	if qlen == 0 {
 		return playerLayout{}
 	}
-	l := makePlayerLayout(fb, t)
-	if t.Art != nil {
-		fb.drawImage(t.Art, l.margin, l.top, l.artSize, l.artSize)
-	} else {
-		fb.rect(l.margin, l.top, l.artSize, l.artSize, color.RGBA{25, 27, 34, 255})
-		noArtScale := scaledFont(l.scale, 2)
-		label := "NO ALBUM ART"
-		fb.text(l.margin+(l.artSize-tw(noArtScale, label))/2, l.top+l.artSize/2-scaledPx(l.scale, 8), noArtScale, label, color.RGBA{130, 130, 135, 255})
+	l := makePlayerLayout(fb, t, cfg)
+	if !effectiveHideAlbumArt(t, cfg) {
+		if t.Art != nil {
+			fb.drawImage(t.Art, l.margin, l.top, l.artSize, l.artSize)
+		} else {
+			fb.rect(l.margin, l.top, l.artSize, l.artSize, color.RGBA{25, 27, 34, 255})
+			noArtScale := scaledFont(l.scale, 2)
+			label := "NO ALBUM ART"
+			fb.text(l.margin+(l.artSize-tw(noArtScale, label))/2, l.top+l.artSize/2-scaledPx(l.scale, 8), noArtScale, label, color.RGBA{130, 130, 135, 255})
+		}
 	}
 	titleScale := scaledFont(l.scale, 5)
 	bodyScale := scaledFont(l.scale, 3)
@@ -2134,8 +2519,15 @@ func drawPlayerStatic(fb *framebuffer, p *Player, sel int, cfg *Config) playerLa
 	}
 	if t.Album != "" {
 		fb.text(l.rightX, metaY, bodyScale, short(t.Album, max(12, l.rightW/(6*bodyScale))), color.RGBA{150, 150, 155, 255})
+		metaY += bodyGap
 	}
+	trackText := fmt.Sprintf("Track: %d of %d", qidx+1, qlen)
+	trackColor := color.RGBA{150, 150, 155, 255}
+	fb.text(l.rightX, metaY, bodyScale, trackText, trackColor)
+	badgeX := l.rightX + tw(bodyScale, trackText) + scaledPx(l.scale, 18)
+	drawInfoBadges(fb, badgeX, metaY, l.rightX+l.rightW, bodyScale, t, cfg)
 	drawPlayerControls(fb, p, sel, l, paused, rep, shuf, stopped, qidx, qlen, cfg)
+	drawClock(fb, cfg, bg)
 	return l
 }
 
@@ -2143,18 +2535,20 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 	bg := playerBackground(cfg)
 	ctrlTop := l.ctrlY - scaledPx(l.scale, 22)
 	ctrlH := fb.h - ctrlTop - scaledPx(l.scale, 55)
+	ctrlX := l.margin
+	ctrlW := fb.w - l.margin*2
 	if ctrlH > 0 {
-		fb.rect(l.rightX, ctrlTop, l.rightW, ctrlH, bg)
+		fb.rect(ctrlX, ctrlTop, ctrlW, ctrlH, bg)
 	}
 	count := 7
-	cellW := l.rightW / count
+	cellW := ctrlW / count
 	boxH := scaledPx(l.scale, 76)
 	iconSize := scaledPx(l.scale, 42)
 	if iconSize > cellW*55/100 {
 		iconSize = cellW * 55 / 100
 	}
 	for i := 0; i < count; i++ {
-		x := l.rightX + i*cellW
+		x := ctrlX + i*cellW
 		cx := x + cellW/2
 		cy := l.ctrlY + boxH/2 - scaledPx(l.scale, 9)
 		if sel == i+1 {
@@ -2188,20 +2582,7 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 			drawEQIcon(fb, cx, cy, iconSize, c)
 		}
 	}
-	statusScale := scaledFont(l.scale, 2)
-	status := fmt.Sprintf("%d/%d", qidx+1, qlen)
-	if stopped {
-		status += "  STOPPED"
-	} else if paused {
-		status += "  PAUSED"
-	}
-	if shuf {
-		status += "  SHUFFLE"
-	}
-	if rep {
-		status += "  REPEAT"
-	}
-	fb.text(l.margin, fb.h-scaledPx(l.scale, 45), statusScale, status, color.RGBA{145, 145, 150, 255})
+
 }
 
 func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg *Config) {
@@ -2209,7 +2590,7 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 		return
 	}
 	bg := playerBackground(cfg)
-	_, lv, _, _, _, _, _, stopped := playerSnapshot(p)
+	_, lv, _, _, paused, _, _, stopped := playerSnapshot(p)
 	vizPad := scaledPx(l.scale, 2)
 	fb.rect(l.rightX-vizPad, l.vizY-vizPad, l.rightW+vizPad*2, l.vizH+vizPad*2, bg)
 	barGap := scaledPx(l.scale, 12)
@@ -2238,8 +2619,13 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 	if duration > 0 {
 		timeTxt += fmt.Sprintf(" / %02d:%02d", int(duration.Minutes()), int(duration.Seconds())%60)
 	}
+	if paused {
+		timeTxt += "   PAUSED"
+	}
 	fb.text(l.rightX, l.timeY, timeScale, timeTxt, color.RGBA{185, 185, 190, 255})
 	barBoxPad := scaledPx(l.scale, 8)
+	barClearPad := barBoxPad + scaledPx(l.scale, 2)
+	fb.rect(l.rightX-barClearPad, l.barY-barClearPad, l.rightW+barClearPad*2, l.barH+barClearPad*2, bg)
 	if sel == 0 {
 		fb.border(l.rightX-barBoxPad, l.barY-barBoxPad, l.rightW+barBoxPad*2, l.barH+barBoxPad*2, scaledPx(l.scale, 2), color.RGBA{255, 255, 255, 255})
 	}
@@ -2274,6 +2660,7 @@ func playerUI(app *App) {
 	drawPlayerDynamic(fb, p, l, sel, cfg)
 	fb.present()
 	lastTrackKey := playerTrackKey(p)
+	lastClock := clockText(cfg)
 	vizTick := time.NewTicker(33 * time.Millisecond)
 	metaTick := time.NewTicker(250 * time.Millisecond)
 	defer vizTick.Stop()
@@ -2327,8 +2714,12 @@ func playerUI(app *App) {
 				p.togglePause()
 				redrawControls = true
 			case actStop:
-				p.stopAndReset()
-				fullRedraw = true
+				external := app.origin == nil
+				app.stopAndUnload()
+				if external {
+					app.jumpSources = true
+				}
+				return
 			case actNowPlaying:
 			case actSources:
 				app.jumpSources = true
@@ -2348,8 +2739,12 @@ func playerUI(app *App) {
 					p.togglePause()
 					redrawControls = true
 				case 3:
-					p.stopAndReset()
-					fullRedraw = true
+					external := app.origin == nil
+					app.stopAndUnload()
+					if external {
+						app.jumpSources = true
+					}
+					return
 				case 4:
 					p.next()
 					fullRedraw = true
@@ -2382,8 +2777,9 @@ func playerUI(app *App) {
 				_, _, qidx, qlen, paused, rep, shuf, stopped := playerSnapshot(p)
 				drawPlayerControls(fb, p, sel, l, paused, rep, shuf, stopped, qidx, qlen, cfg)
 				drawPlayerDynamic(fb, p, l, sel, cfg)
-				fb.presentRegion(l.rightX-scaledPx(l.scale, 10), l.barY-scaledPx(l.scale, 12), l.rightW+scaledPx(l.scale, 20), fb.h-l.barY+scaledPx(l.scale, 12))
-				fb.presentRegion(l.margin, fb.h-scaledPx(l.scale, 55), max(1, l.rightX-l.margin), scaledPx(l.scale, 55))
+				fb.presentRegion(l.rightX-scaledPx(l.scale, 10), l.barY-scaledPx(l.scale, 12), l.rightW+scaledPx(l.scale, 20), l.barH+scaledPx(l.scale, 24))
+				ctrlTop := l.ctrlY - scaledPx(l.scale, 22)
+				fb.presentRegion(l.margin, ctrlTop, fb.w-l.margin*2, fb.h-ctrlTop)
 			}
 		case <-vizTick.C:
 			drawPlayerDynamic(fb, p, l, sel, cfg)
@@ -2395,6 +2791,14 @@ func playerUI(app *App) {
 				drawPlayerDynamic(fb, p, l, sel, cfg)
 				fb.present()
 				lastTrackKey = k
+				lastClock = clockText(cfg)
+				continue
+			}
+			ct := clockText(cfg)
+			if ct != lastClock {
+				x, y, w, h := drawClock(fb, cfg, playerBackground(cfg))
+				fb.presentRegion(x, y, w, h)
+				lastClock = ct
 			}
 		}
 	}
@@ -2402,6 +2806,8 @@ func playerUI(app *App) {
 
 func eqUI(app *App) {
 	fb, acts, cfg := app.fb, app.acts, app.cfg
+	clockTick := time.NewTicker(30 * time.Second)
+	defer clockTick.Stop()
 	names := []string{"ENABLED", "BASS 60HZ", "LOW-MID 250HZ", "MID 1KHZ", "HIGH-MID 4KHZ", "TREBLE 12KHZ", "RESET FLAT"}
 	sel := 0
 	for {
@@ -2422,9 +2828,12 @@ func eqUI(app *App) {
 			y += row
 		}
 		drawEQFooter(fb)
+		drawClock(fb, cfg, appBackground(cfg))
 		fb.present()
 		var a action
 		select {
+		case <-clockTick.C:
+			continue
 		case a = <-acts:
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
@@ -2490,14 +2899,19 @@ func onoff(b bool) string {
 }
 func message(app *App, title, msg string) {
 	fb, acts := app.fb, app.acts
+	clockTick := time.NewTicker(30 * time.Second)
+	defer clockTick.Stop()
 	for {
 		fb.fill(appBackground(app.cfg))
 		drawTitle(fb, title)
 		fb.text(40, fb.h/2, 2, short(msg, max(20, fb.w/12)), color.RGBA{230, 230, 230, 255})
 		drawMessageFooter(fb)
+		drawClock(fb, app.cfg, appBackground(app.cfg))
 		fb.present()
 		var a action
 		select {
+		case <-clockTick.C:
+			continue
 		case a = <-acts:
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
@@ -2602,7 +3016,7 @@ func readCDTOC(dev string) ([]Track, error) {
 			end = es[i+1].lba
 		}
 		dur := float64(end-x.lba) / 75.0
-		out = append(out, Track{Path: fmt.Sprintf("cdda:%s:%d:%d", dev, x.lba, end), Title: fmt.Sprintf("Track %02d", x.track), Album: "Audio CD", Duration: dur})
+		out = append(out, Track{Path: fmt.Sprintf("cdda:%s:%d:%d", dev, x.lba, end), Title: fmt.Sprintf("Track %02d", x.track), Album: "Audio CD", Duration: dur, MediaFormat: "CDDA", BitDepth: 16, SampleRate: 44100, BitRate: 1411})
 	}
 	if len(out) == 0 {
 		return nil, errors.New("disc contains no audio tracks")
@@ -2610,10 +3024,13 @@ func readCDTOC(dev string) ([]Track, error) {
 	return out, nil
 }
 func currentReturnName(app *App, origin *browseOrigin) string {
-	if origin == nil || app.player == nil {
+	if origin == nil {
 		return ""
 	}
 	name := origin.Selected
+	if app.player == nil {
+		return name
+	}
 	if ext := strings.ToLower(filepath.Ext(name)); ext == ".m3u" || ext == ".m3u8" {
 		return name
 	}
@@ -2648,7 +3065,25 @@ func runBrowserSource(app *App, root, kind string) {
 
 func settingsUI(app *App) {
 	fb, acts, cfg := app.fb, app.acts, app.cfg
+	clockTick := time.NewTicker(30 * time.Second)
+	defer clockTick.Stop()
 	sel := 0
+	labels := []string{"OLED MODE", "SHOW ALBUM ART", "AUTO HIDE MISSING ART", "SHOW CLOCK", "GAPLESS PLAYBACK (EXPERIMENTAL)", "SWAP A/B", "SWAP X/Y"}
+	enabled := func(i int) bool {
+		return i != 2 || !cfg.HideAlbumArt
+	}
+	move := func(from, dir int) int {
+		i := from
+		for {
+			i += dir
+			if i < 0 || i >= len(labels) {
+				return from
+			}
+			if enabled(i) {
+				return i
+			}
+		}
+	}
 	for {
 		if app.jumpSources {
 			return
@@ -2657,22 +3092,47 @@ func settingsUI(app *App) {
 		drawTitle(fb, "SETTINGS")
 		row := max(34, fb.h/10)
 		y0 := 82
-		labels := []string{"OLED MODE", "SWAP A/B", "SWAP X/Y"}
-		values := []string{onoff(cfg.OLEDMode), onoff(cfg.SwapAB), onoff(cfg.SwapXY)}
+		values := []string{
+			onoff(cfg.OLEDMode),
+			onoff(!cfg.HideAlbumArt),
+			onoff(cfg.AutoHideMissingArt),
+			onoff(cfg.ShowClock),
+			onoff(cfg.GaplessPlayback),
+			onoff(cfg.SwapAB),
+			onoff(cfg.SwapXY),
+		}
 		ts := max(1, row/22)
 		for i := range labels {
 			y := y0 + i*row
-			if sel == i {
+			rowEnabled := enabled(i)
+			if sel == i && rowEnabled {
 				fb.rect(45, y-5, fb.w-90, row-5, color.RGBA{35, 37, 46, 255})
 				fb.border(45, y-5, fb.w-90, row-5, 2, color.RGBA{240, 240, 240, 255})
 			}
-			fb.text(65, y+6, ts, labels[i], color.RGBA{235, 235, 235, 255})
-			fb.text(fb.w-65-tw(ts, values[i]), y+6, ts, values[i], color.RGBA{200, 200, 205, 255})
+			labelColor := color.RGBA{235, 235, 235, 255}
+			valueColor := color.RGBA{200, 200, 205, 255}
+			if !rowEnabled {
+				labelColor = color.RGBA{90, 90, 96, 255}
+				valueColor = color.RGBA{75, 75, 82, 255}
+			}
+			labelY := y + 6
+			if i == 4 {
+				labelY = y + 2
+			}
+			fb.text(65, labelY, ts, labels[i], labelColor)
+			if i == 4 {
+				subScale := max(1, ts-1)
+				fb.text(65, labelY+ts*8, subScale, "FLAC / WAV / CDDA ONLY", color.RGBA{125, 125, 132, 255})
+			}
+			fb.text(fb.w-65-tw(ts, values[i]), y+6, ts, values[i], valueColor)
 		}
 		drawBrowserFooter(fb, false)
+		drawClock(fb, cfg, appBackground(cfg))
 		fb.present()
 		var a action
 		select {
+		case <-clockTick.C:
+			continue
 		case a = <-acts:
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
@@ -2694,21 +3154,36 @@ func settingsUI(app *App) {
 			saveConfig(*cfg)
 			return
 		case actUp:
-			if sel > 0 {
-				sel--
-			}
+			sel = move(sel, -1)
 		case actDown:
-			if sel < len(labels)-1 {
-				sel++
-			}
+			sel = move(sel, 1)
 		case actConfirm, actLeft, actRight:
+			if !enabled(sel) {
+				continue
+			}
 			switch sel {
 			case 0:
 				cfg.OLEDMode = !cfg.OLEDMode
 			case 1:
+				cfg.HideAlbumArt = !cfg.HideAlbumArt
+			case 2:
+				cfg.AutoHideMissingArt = !cfg.AutoHideMissingArt
+			case 3:
+				cfg.ShowClock = !cfg.ShowClock
+			case 4:
+				cfg.GaplessPlayback = !cfg.GaplessPlayback
+				if app.player != nil {
+					app.player.mu.Lock()
+					app.player.cfg.GaplessPlayback = cfg.GaplessPlayback
+					app.player.mu.Unlock()
+					if cfg.GaplessPlayback {
+						app.player.prepareGaplessNextFile()
+					}
+				}
+			case 5:
 				cfg.SwapAB = !cfg.SwapAB
 				swapABInput.Store(cfg.SwapAB)
-			case 2:
+			case 6:
 				cfg.SwapXY = !cfg.SwapXY
 				swapXYInput.Store(cfg.SwapXY)
 			}

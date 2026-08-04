@@ -10,6 +10,9 @@ func nativeAudioStartFile(string, EQConfig) error {
 func nativeAudioStartPCM(EQConfig) error {
 	return errors.New("MiSTer Hi-Fi audio engine requires a CGO build")
 }
+func nativeAudioQueueNextFile(string) error      { return nil }
+func nativeAudioMarkPCMTransition(float64) error { return nil }
+func nativeAudioTakeTransition() bool            { return false }
 func nativeAudioWritePCM([]byte) error {
 	return errors.New("MiSTer Hi-Fi audio engine requires a CGO build")
 }

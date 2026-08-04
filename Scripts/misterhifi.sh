@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="0.4.1"
+VERSION="0.9.0"
 BASE="/media/fat/Scripts/.config/MiSTerHiFi"
 BIN="$BASE/mister_hifi"
 SOCK="/tmp/misterhifi.sock"

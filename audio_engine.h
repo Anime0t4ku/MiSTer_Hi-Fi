@@ -3,6 +3,9 @@
 #include <stddef.h>
 int mh_audio_start_file(const char* path, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble);
 int mh_audio_start_pcm(int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble);
+int mh_audio_queue_next_file(const char* path);
+int mh_audio_mark_pcm_transition(double next_duration);
+int mh_audio_take_transition(void);
 int mh_audio_write_pcm(const void* data, size_t bytes);
 void mh_audio_finish_pcm(void);
 void mh_audio_pause(int paused);

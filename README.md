@@ -195,7 +195,7 @@ Home     Sources
 
 L1       Previous Track
 X        Play / Pause
-Y        Stop
+Y        Stop / Unload / Return to Track List
 R1       Next Track
 Start    Now Playing
 ```
@@ -227,6 +227,29 @@ Playback continues while browsing other sources and folders.
 
 A Now Playing / Paused / Loaded bar remains available while browsing and can be selected to return to the player.
 
+## Audio Information
+
+Now Playing displays the source audio format next to the track number.
+
+Example:
+
+```text
+Track: 1 of 12    FLAC    16 bit    44.1 kHz    770 kbps
+```
+
+The audio information is shown in compact white blocks and includes the media format, bit depth when applicable, sample rate and bitrate.
+
+Physical Audio CDs are shown as `CDDA`, `16 bit`, `44.1 kHz` and `1411 kbps`.
+
+## Display Settings
+
+- **OLED Mode** uses a true-black background.
+- **Show Album Art** enables the album-art player layout.
+- **Auto Hide Missing Art** automatically uses the full-width no-art player layout when the current track has no artwork. This option is disabled in Settings while Show Album Art is Off.
+- **Show Clock** displays the MiSTer's 24-hour system clock in the top-right corner on every MiSTer Hi-Fi screen.
+- **Gapless Playback (Experimental)** enables seamless natural track-to-track transitions for FLAC, WAV and physical Audio CD (CDDA) playback. MP3 is intentionally excluded. The setting is Off by default.
+- **Swap A/B** and **Swap X/Y** change physical controller behavior without changing the on-screen button labels.
+
 ## Equalizer
 
 MiSTer Hi-Fi includes a 5-band equalizer.
@@ -249,11 +272,14 @@ MiSTer Hi-Fi includes the following application settings:
 
 ```text
 OLED Mode
+Show Album Art
 Swap A/B
 Swap X/Y
 ```
 
 **OLED Mode** changes the main application background from dark grey to true black.
+
+**Show Album Art** controls whether artwork is shown in Now Playing. When disabled, the player reflows to use the full width for track information, progress seeking, the visualizer and centered playback controls.
 
 **Swap A/B** and **Swap X/Y** change the physical controller button behavior without changing the button labels shown in the interface. This makes it possible to use Nintendo-, Xbox- or PlayStation-style controller layouts while keeping MiSTer Hi-Fi's on-screen controls consistent.
 
