@@ -22,21 +22,28 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
-const version = "0.3.9"
+const version = "0.4.1"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
+const smbMountRoot = "/tmp/misterhifi-mnt"
 
 var supported = map[string]bool{".mp3": true, ".wav": true, ".flac": true, ".m3u": true, ".m3u8": true}
+
+var swapABInput atomic.Bool
+var swapXYInput atomic.Bool
 
 type Config struct {
 	EQ         EQConfig `json:"eq"`
 	Visualizer string   `json:"visualizer"`
 	OLEDMode   bool     `json:"oled_mode"`
+	SwapAB     bool     `json:"swap_ab"`
+	SwapXY     bool     `json:"swap_xy"`
 }
 type EQConfig struct {
 	Enabled                            bool `json:"enabled"`
@@ -395,20 +402,36 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 						case keyHome, btnMode:
 							a = actSources
 						case btnSouth:
-							a = actBack
+							if swapABInput.Load() {
+								a = actConfirm
+							} else {
+								a = actBack
+							}
 							face = true
 						case btnEast:
-							a = actConfirm
+							if swapABInput.Load() {
+								a = actBack
+							} else {
+								a = actConfirm
+							}
 							face = true
 						case btnTL:
 							a = actPrev
 						case btnTR:
 							a = actNext
 						case btnWest:
-							a = actPlayPause
+							if swapXYInput.Load() {
+								a = actStop
+							} else {
+								a = actPlayPause
+							}
 							face = true
 						case btnNorth:
-							a = actStop
+							if swapXYInput.Load() {
+								a = actPlayPause
+							} else {
+								a = actStop
+							}
 							face = true
 						case btnStart:
 							a = actNowPlaying
@@ -519,14 +542,71 @@ func isMounted(path string) bool {
 	}
 	return false
 }
+
+func decodeMountField(s string) string {
+	r := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+	return r.Replace(s)
+}
+
+func mountedSource(path string) string {
+	b, e := os.ReadFile("/proc/mounts")
+	if e != nil {
+		return ""
+	}
+	clean := filepath.Clean(path)
+	for _, line := range strings.Split(string(b), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if filepath.Clean(decodeMountField(fields[1])) == clean {
+			return decodeMountField(fields[0])
+		}
+	}
+	return ""
+}
+
+func sameSMBSource(got, server, share string) bool {
+	got = strings.ReplaceAll(strings.TrimSpace(got), `\`, "/")
+	want := "//" + strings.Trim(server, "/") + "/" + strings.Trim(share, "/")
+	return strings.EqualFold(got, want)
+}
+
+var smbMountMu sync.Mutex
+var smbManagedMounts = map[string]struct{}{}
+
+func registerSMBMount(path string) {
+	smbMountMu.Lock()
+	smbManagedMounts[path] = struct{}{}
+	smbMountMu.Unlock()
+}
+
+func cleanupSMBMounts() {
+	smbMountMu.Lock()
+	paths := make([]string, 0, len(smbManagedMounts))
+	for path := range smbManagedMounts {
+		paths = append(paths, path)
+	}
+	smbMountMu.Unlock()
+	for _, path := range paths {
+		if isMounted(path) {
+			_ = exec.Command("umount", path).Run()
+		}
+		if !isMounted(path) {
+			_ = os.Remove(path)
+		}
+	}
+	_ = os.Remove(smbMountRoot)
+}
+
 func mountShare(s SMBShare) (string, error) {
 	name := s.Name
 	if name == "" {
 		name = s.Server + "_" + s.Share
 	}
-	m := filepath.Join(baseDir, "mnt", sanitize(name))
-	_ = os.MkdirAll(m, 0755)
-	if !isMounted(m) {
+	mountRoot := filepath.Join(smbMountRoot, sanitize(name))
+	_ = os.MkdirAll(mountRoot, 0755)
+	if !isMounted(mountRoot) {
 		src := "//" + s.Server + "/" + s.Share
 		auth := []string{"ro"}
 		if s.Guest {
@@ -541,25 +621,54 @@ func mountShare(s SMBShare) (string, error) {
 			append([]string{}, auth...),
 			append(append([]string{}, auth...), "vers=1.0"),
 		}
-		var last string
-		for _, opts := range attempts {
-			cmd := exec.Command("mount", "-t", "cifs", src, m, "-o", strings.Join(opts, ","))
-			out, err := cmd.CombinedOutput()
-			if err == nil || isMounted(m) {
-				last = ""
-				break
+		sources := []string{src}
+		if strings.Contains(s.Share, " ") {
+			escaped := "//" + s.Server + "/" + strings.ReplaceAll(s.Share, " ", `\040`)
+			encoded := "//" + s.Server + "/" + strings.ReplaceAll(s.Share, " ", "%20")
+			if escaped != src {
+				sources = append(sources, escaped)
 			}
-			last = strings.TrimSpace(string(out))
-			if last == "" {
-				last = err.Error()
+			if encoded != src && encoded != escaped {
+				sources = append(sources, encoded)
 			}
 		}
-		if !isMounted(m) {
+		var last string
+		for _, mountSrc := range sources {
+			for _, opts := range attempts {
+				cmd := exec.Command("mount", "-t", "cifs", mountSrc, mountRoot, "-o", strings.Join(opts, ","))
+				out, err := cmd.CombinedOutput()
+				if err == nil || isMounted(mountRoot) {
+					if isMounted(mountRoot) && sameSMBSource(mountedSource(mountRoot), s.Server, s.Share) {
+						last = ""
+						break
+					}
+					if isMounted(mountRoot) {
+						got := mountedSource(mountRoot)
+						_ = exec.Command("umount", mountRoot).Run()
+						last = "mounted unexpected share: " + got
+						continue
+					}
+				}
+				last = strings.TrimSpace(string(out))
+				if last == "" {
+					last = err.Error()
+				}
+			}
+			if isMounted(mountRoot) && sameSMBSource(mountedSource(mountRoot), s.Server, s.Share) {
+				break
+			}
+		}
+		if !isMounted(mountRoot) || !sameSMBSource(mountedSource(mountRoot), s.Server, s.Share) {
+			if isMounted(mountRoot) {
+				_ = exec.Command("umount", mountRoot).Run()
+			}
 			return "", fmt.Errorf("unable to mount //%s/%s: %s", s.Server, s.Share, last)
 		}
 	}
+	registerSMBMount(mountRoot)
+	m := mountRoot
 	if s.Path != "" {
-		m = filepath.Join(m, filepath.FromSlash(s.Path))
+		m = filepath.Join(mountRoot, filepath.FromSlash(s.Path))
 		if st, e := os.Stat(m); e != nil || !st.IsDir() {
 			return "", fmt.Errorf("SMB path not found: %s", s.Path)
 		}
@@ -2547,16 +2656,19 @@ func settingsUI(app *App) {
 		fb.fill(appBackground(cfg))
 		drawTitle(fb, "SETTINGS")
 		row := max(34, fb.h/10)
-		y := 82
-		if sel == 0 {
-			fb.rect(45, y-5, fb.w-90, row-5, color.RGBA{35, 37, 46, 255})
-			fb.border(45, y-5, fb.w-90, row-5, 2, color.RGBA{240, 240, 240, 255})
-		}
+		y0 := 82
+		labels := []string{"OLED MODE", "SWAP A/B", "SWAP X/Y"}
+		values := []string{onoff(cfg.OLEDMode), onoff(cfg.SwapAB), onoff(cfg.SwapXY)}
 		ts := max(1, row/22)
-		label := "OLED MODE"
-		value := onoff(cfg.OLEDMode)
-		fb.text(65, y+6, ts, label, color.RGBA{235, 235, 235, 255})
-		fb.text(fb.w-65-tw(ts, value), y+6, ts, value, color.RGBA{200, 200, 205, 255})
+		for i := range labels {
+			y := y0 + i*row
+			if sel == i {
+				fb.rect(45, y-5, fb.w-90, row-5, color.RGBA{35, 37, 46, 255})
+				fb.border(45, y-5, fb.w-90, row-5, 2, color.RGBA{240, 240, 240, 255})
+			}
+			fb.text(65, y+6, ts, labels[i], color.RGBA{235, 235, 235, 255})
+			fb.text(fb.w-65-tw(ts, values[i]), y+6, ts, values[i], color.RGBA{200, 200, 205, 255})
+		}
 		drawBrowserFooter(fb, false)
 		fb.present()
 		var a action
@@ -2581,8 +2693,25 @@ func settingsUI(app *App) {
 		case actBack:
 			saveConfig(*cfg)
 			return
+		case actUp:
+			if sel > 0 {
+				sel--
+			}
+		case actDown:
+			if sel < len(labels)-1 {
+				sel++
+			}
 		case actConfirm, actLeft, actRight:
-			cfg.OLEDMode = !cfg.OLEDMode
+			switch sel {
+			case 0:
+				cfg.OLEDMode = !cfg.OLEDMode
+			case 1:
+				cfg.SwapAB = !cfg.SwapAB
+				swapABInput.Store(cfg.SwapAB)
+			case 2:
+				cfg.SwapXY = !cfg.SwapXY
+				swapXYInput.Store(cfg.SwapXY)
+			}
 			saveConfig(*cfg)
 		}
 	}
@@ -2672,7 +2801,7 @@ func sourcesUI(app *App) {
 		}
 		items = append(items, "", "SETTINGS")
 		types = append(types, "separator", "settings")
-		i, ok := menu(app, "MISTER HI-FI", items, 0)
+		i, ok := menu(app, "MISTER HI-FI v"+version, items, 0)
 		if !ok {
 			if app.jumpSources {
 				app.jumpSources = false
@@ -2733,8 +2862,7 @@ func sourcesUI(app *App) {
 }
 
 func main() {
-	_ = os.MkdirAll(filepath.Join(baseDir, "tmp"), 0755)
-	_ = os.MkdirAll(filepath.Join(baseDir, "mnt"), 0755)
+	_ = os.MkdirAll(smbMountRoot, 0755)
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Println("MiSTer Hi-Fi v" + version)
 		return
@@ -2777,12 +2905,15 @@ func main() {
 	defer fb.close()
 	term := quietTerm()
 	defer term.restore()
+	cfg := loadConfig()
+	swapABInput.Store(cfg.SwapAB)
+	swapXYInput.Store(cfg.SwapXY)
 	done := make(chan struct{})
 	acts := make(chan action, 8)
 	inputLoop(acts, done)
 	defer close(done)
-	cfg := loadConfig()
 	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg}
+	defer cleanupSMBMounts()
 	defer func() {
 		if app.player != nil {
 			app.player.stopPlaybackRaw()

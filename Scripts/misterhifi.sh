@@ -1,9 +1,13 @@
 #!/bin/bash
+VERSION="0.4.1"
 BASE="/media/fat/Scripts/.config/MiSTerHiFi"
 BIN="$BASE/mister_hifi"
 SOCK="/tmp/misterhifi.sock"
 
-mkdir -p "$BASE/cache" "$BASE/tmp" "$BASE/mnt"
+if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
+  echo "MiSTer Hi-Fi v$VERSION"
+  exit 0
+fi
 
 if [ ! -x "$BIN" ]; then
   chmod +x "$BIN" 2>/dev/null

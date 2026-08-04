@@ -16,10 +16,7 @@ The files will be installed under:
 └── .config/
     └── MiSTerHiFi/
         ├── mister_hifi
-        ├── smb.example.json
-        ├── cache/
-        ├── mnt/
-        └── tmp/
+        └── smb.example.json
 ```
 
 MiSTer Hi-Fi creates its configuration automatically on first launch.
@@ -114,12 +111,26 @@ Multiple shares can be configured.
 
 SMB playback uses background read-ahead buffering so short network or storage delays do not interrupt playback while still keeping startup fast.
 
+SMB shares are mounted temporarily under:
+
+```text
+/tmp/misterhifi-mnt/
+```
+
+No network shares are mounted inside the MiSTer Hi-Fi configuration folder.
+
 ## Launching
 
 Open MiSTer Hi-Fi normally:
 
 ```bash
 /media/fat/Scripts/misterhifi.sh
+```
+
+Show the installed version:
+
+```bash
+/media/fat/Scripts/misterhifi.sh --version
 ```
 
 Play a single file directly:
@@ -232,13 +243,25 @@ The bands are centered around:
 
 The equalizer is applied directly to the active playback path.
 
-## OLED Mode
+## Settings
 
-OLED Mode can be enabled from Settings.
+MiSTer Hi-Fi includes the following application settings:
 
-When enabled, the main application background uses true black instead of the normal dark grey background.
+```text
+OLED Mode
+Swap A/B
+Swap X/Y
+```
 
-The setting is saved automatically.
+**OLED Mode** changes the main application background from dark grey to true black.
+
+**Swap A/B** and **Swap X/Y** change the physical controller button behavior without changing the button labels shown in the interface. This makes it possible to use Nintendo-, Xbox- or PlayStation-style controller layouts while keeping MiSTer Hi-Fi's on-screen controls consistent.
+
+Settings are saved automatically in:
+
+```text
+/media/fat/Scripts/.config/MiSTerHiFi/config.json
+```
 
 ## Building From Source
 
@@ -274,7 +297,6 @@ MiSTer Hi-Fi uses [miniaudio](https://github.com/mackron/miniaudio) by David Rei
 miniaudio is available under the author's choice of **Public Domain** or the **MIT No Attribution (MIT-0) License**.
 
 MiSTer Hi-Fi does not include `miniaudio.h` in its source repository. `fetch_miniaudio.sh` downloads the pinned upstream version used by the project during the build process.
-
 
 ## License
 
