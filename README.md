@@ -54,6 +54,7 @@ Current audio support:
 MP3
 FLAC
 WAV
+M4A (AAC / ALAC)
 M3U
 M3U8
 Audio CD
@@ -241,7 +242,7 @@ Example:
 Track: 1 of 12    FLAC    16 bit    44.1 kHz    770 kbps
 ```
 
-The audio information is shown in compact white blocks and includes the media format, bit depth when applicable, sample rate and bitrate.
+The audio information is shown in compact white blocks and includes the media format, bit depth when applicable, sample rate and bitrate. M4A files identify the contained codec as `AAC` or `ALAC`; ALAC reports bit depth when available.
 
 Physical Audio CDs are shown as `CDDA`, `16 bit`, `44.1 kHz` and `1411 kbps`.
 
@@ -378,3 +379,12 @@ The built-in MiSTer Hi-Fi bitmap font remains the default and primary UI font. C
 ### v1.2.0 metadata reliability
 
 FLAC metadata loading now retries short-lived file read/open failures and only applies parsed metadata after a complete successful metadata pass. This improves metadata reliability on slower or network-backed storage without delaying audio playback.
+
+
+## M4A / Apple Music & iTunes
+
+MiSTer Hi-Fi supports `.m4a` audio containing AAC-LC or Apple Lossless (ALAC). M4A playback uses an isolated Symphonia decoder path, while MP3, FLAC and WAV continue to use the existing miniaudio path. Embedded MP4 metadata and cover artwork are read from the file.
+
+The M4A decoder is built with only Symphonia's ISO/MP4, AAC and ALAC features enabled. Symphonia is licensed under MPL-2.0; its license text is included in `licenses/Symphonia-MPL-2.0.txt`. MP4 tag parsing uses `github.com/dhowden/tag` under BSD-2-Clause.
+
+Building M4A support requires Rust/Cargo and the `armv7-unknown-linux-gnueabihf` Rust target in addition to the existing ARM GCC toolchain. The build script adds the target automatically when `rustup` is available.

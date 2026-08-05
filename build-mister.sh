@@ -5,6 +5,8 @@ cd "$(dirname "$0")"
 
 ./fetch_miniaudio.sh
 
+go mod download
+
 TOOLCHAIN="/opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/bin"
 if [ -d "$TOOLCHAIN" ]; then
     PATH="$TOOLCHAIN:$PATH"
@@ -22,6 +24,17 @@ command -v go >/dev/null 2>&1 || {
 }
 
 mkdir -p Scripts/.config/MiSTerHiFi
+
+command -v cargo >/dev/null 2>&1 || {
+    echo "Error: Rust/Cargo is required for M4A (AAC/ALAC) support." >&2
+    echo "Install Rust with rustup, then run: rustup target add armv7-unknown-linux-gnueabihf" >&2
+    exit 1
+}
+rustup target add armv7-unknown-linux-gnueabihf >/dev/null 2>&1 || true
+(
+    cd m4a_decoder
+    CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER="$CC" cargo build --release --target armv7-unknown-linux-gnueabihf
+)
 
 GOOS=linux \
 GOARCH=arm \

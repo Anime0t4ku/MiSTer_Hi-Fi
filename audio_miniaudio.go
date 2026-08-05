@@ -4,14 +4,17 @@ package main
 
 /*
 #cgo CFLAGS: -std=c11 -O2
-#cgo LDFLAGS: -lpthread -lm -ldl -latomic
+#cgo LDFLAGS: -L${SRCDIR}/m4a_decoder/target/armv7-unknown-linux-gnueabihf/release -lmisterhifi_m4a -lpthread -lm -ldl -latomic
 #include <stdlib.h>
 #include "audio_engine.h"
+#include "m4a_bridge.h"
 */
 import "C"
 
 import (
 	"errors"
+	"path/filepath"
+	"strings"
 	"unsafe"
 )
 
@@ -25,7 +28,12 @@ func nativeAudioStartTrack(t Track, eq EQConfig) error {
 	if eq.Enabled {
 		enabled = 1
 	}
-	r := C.mh_audio_start_fd(C.int(f.Fd()), enabled, C.float(eq.Bass), C.float(eq.LowMid), C.float(eq.Mid), C.float(eq.HighMid), C.float(eq.Treble))
+	var r C.int
+	if strings.EqualFold(filepath.Ext(t.Path), ".m4a") {
+		r = C.mh_audio_start_m4a_fd(C.int(f.Fd()), enabled, C.float(eq.Bass), C.float(eq.LowMid), C.float(eq.Mid), C.float(eq.HighMid), C.float(eq.Treble))
+	} else {
+		r = C.mh_audio_start_fd(C.int(f.Fd()), enabled, C.float(eq.Bass), C.float(eq.LowMid), C.float(eq.Mid), C.float(eq.HighMid), C.float(eq.Treble))
+	}
 	if r != 0 {
 		return errors.New(C.GoString(C.mh_audio_last_error()))
 	}
@@ -111,4 +119,24 @@ func nativeAudioLevels() [10]float64 {
 		out[i] = float64(vals[i])
 	}
 	return out
+}
+
+func nativeM4AProbeTrack(t Track) (string, int, int, float64, error) {
+	f, err := openTrackFile(t)
+	if err != nil {
+		return "", 0, 0, 0, err
+	}
+	defer f.Close()
+	var codec, rate, bits C.int
+	var duration C.double
+	if C.mh_m4a_probe_fd(C.int(f.Fd()), &codec, &rate, &bits, &duration) != 0 {
+		return "", 0, 0, 0, errors.New("unable to read M4A stream information")
+	}
+	name := "M4A"
+	if codec == 1 {
+		name = "AAC"
+	} else if codec == 2 {
+		name = "ALAC"
+	}
+	return name, int(rate), int(bits), float64(duration), nil
 }

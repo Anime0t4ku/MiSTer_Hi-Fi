@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "audio_engine.h"
+#include "m4a_bridge.h"
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 #include <math.h>
@@ -33,6 +34,10 @@ typedef struct {
     ma_device device;
     ma_decoder decoder;
     ma_pcm_rb ring;
+    void* m4a_decoder;
+    ma_resampler m4a_resampler;
+    int m4a_resampler_init;
+    int m4a_rate;
     pthread_t decoder_thread;
     int decoder_thread_init;
     volatile int decoder_thread_stop;
@@ -198,6 +203,53 @@ static int mh_ring_write_f32(const float* src, ma_uint32 frames) {
     return done == frames ? 0 : -1;
 }
 
+static int mh_m4a_decode_to_ring(ma_uint32 source_frames) {
+    if (!g.m4a_decoder || !g.m4a_resampler_init) return -1;
+    float inbuf[MH_FILE_DECODE_CHUNK * MH_CHANNELS];
+    float outbuf[MH_FILE_DECODE_CHUNK * 8 * MH_CHANNELS];
+    while (source_frames > 0 && !g.decoder_thread_stop) {
+        int want = (int)source_frames;
+        if (want > MH_FILE_DECODE_CHUNK) want = MH_FILE_DECODE_CHUNK;
+        int got = mh_m4a_read_stereo_f32(g.m4a_decoder, inbuf, want);
+        if (got < 0) return -1;
+        if (got == 0) { g.decoder_eof = 1; return 0; }
+        ma_uint64 in_frames = (ma_uint64)got;
+        ma_uint64 out_frames = (ma_uint64)((double)got * (double)MH_RATE / (double)g.m4a_rate) + 32;
+        ma_uint64 out_cap = MH_FILE_DECODE_CHUNK * 8;
+        if (out_frames > out_cap) out_frames = out_cap;
+        if (ma_resampler_process_pcm_frames(&g.m4a_resampler, inbuf, &in_frames, outbuf, &out_frames) != MA_SUCCESS) return -1;
+        if (out_frames > 0 && mh_ring_write_f32(outbuf, (ma_uint32)out_frames) != 0) return -1;
+        if ((ma_uint32)got >= source_frames) break;
+        source_frames -= (ma_uint32)got;
+    }
+    return 0;
+}
+
+static void* mh_m4a_decode_worker(void* arg) {
+    (void)arg;
+    while (!g.decoder_thread_stop) {
+        ma_uint32 avail = ma_pcm_rb_available_write(&g.ring);
+        if (avail < 512) { mh_sleep_us(1000); continue; }
+        ma_uint32 want = MH_FILE_DECODE_CHUNK;
+        if (mh_m4a_decode_to_ring(want) != 0) {
+            g.decoder_eof = 1;
+            break;
+        }
+        if (g.decoder_eof) break;
+    }
+    return NULL;
+}
+
+static int mh_start_m4a_decoder_thread(void) {
+    g.decoder_thread_stop = 0;
+    if (pthread_create(&g.decoder_thread, NULL, mh_m4a_decode_worker, NULL) != 0) {
+        mh_seterr("unable to start M4A read-ahead worker");
+        return -1;
+    }
+    g.decoder_thread_init = 1;
+    return 0;
+}
+
 static void* mh_file_decode_worker(void* arg) {
     (void)arg;
     float pcm[MH_FILE_DECODE_CHUNK * MH_CHANNELS];
@@ -307,7 +359,7 @@ static void mh_callback(ma_device* d, void* out, const void* in, ma_uint32 frame
     memset(dst,0,frameCount*MH_CHANNELS*sizeof(float));
     if (g.paused || g.mode==0) return;
     ma_uint64 got=0;
-    if (g.mode==1 || g.mode==2) {
+    if (g.mode==1 || g.mode==2 || g.mode==3) {
         ma_uint32 remaining=frameCount;
         while (remaining>0) {
             ma_uint32 avail=ma_pcm_rb_available_read(&g.ring);
@@ -322,7 +374,7 @@ static void mh_callback(ma_device* d, void* out, const void* in, ma_uint32 frame
             got+=cont;
             remaining-=cont;
         }
-        if (g.mode==1 && g.decoder_eof && ma_pcm_rb_available_read(&g.ring)==0) g.ended=1;
+        if ((g.mode==1 || g.mode==3) && g.decoder_eof && ma_pcm_rb_available_read(&g.ring)==0) g.ended=1;
         if (g.mode==2 && g.pcm_eof && ma_pcm_rb_available_read(&g.ring)==0) g.ended=1;
     }
     if (got>0) {
@@ -357,6 +409,9 @@ void mh_audio_stop(void) {
     mh_stop_decoder_thread();
     if (g.decoder_init) { ma_decoder_uninit(&g.decoder); g.decoder_init=0; }
     mh_fd_source_free(g.decoder_source); g.decoder_source=NULL;
+    if (g.m4a_resampler_init) { ma_resampler_uninit(&g.m4a_resampler, NULL); g.m4a_resampler_init=0; }
+    if (g.m4a_decoder) { mh_m4a_close(g.m4a_decoder); g.m4a_decoder=NULL; }
+    g.m4a_rate=0;
     if (g.ring_init) { ma_pcm_rb_uninit(&g.ring); g.ring_init=0; }
     g.mode=0; g.paused=0; g.ended=0; g.pcm_eof=0; g.decoder_eof=0;
     g.frames_played=0; g.frames_written=0; g.track_start_frame=0; g.transition_frame=0;
@@ -384,6 +439,27 @@ int mh_audio_start_fd(int fd, int eq_enabled, float bass, float lowmid, float mi
     mh_setup_eq(eq_enabled,bass,lowmid,mid,highmid,treble);
     if (mh_prefill_file_ring(MH_FILE_PREFILL_FRAMES)!=0) { mh_seterr("unable to prefill audio buffer"); mh_audio_stop(); return -1; }
     if (!g.decoder_eof && mh_start_decoder_thread()!=0) { mh_audio_stop(); return -1; }
+    if (mh_start_device()!=0) { mh_audio_stop(); return -1; }
+    return 0;
+}
+
+int mh_audio_start_m4a_fd(int fd, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble) {
+    mh_audio_stop();
+    g.m4a_decoder = mh_m4a_open_fd(fd);
+    if (!g.m4a_decoder) { mh_seterr("unable to decode M4A file"); return -1; }
+    g.m4a_rate = mh_m4a_sample_rate(g.m4a_decoder);
+    if (g.m4a_rate <= 0) { mh_seterr("invalid M4A sample rate"); mh_audio_stop(); return -1; }
+    ma_resampler_config rc = ma_resampler_config_init(ma_format_f32, MH_CHANNELS, (ma_uint32)g.m4a_rate, MH_RATE, ma_resample_algorithm_linear);
+    if (ma_resampler_init(&rc, NULL, &g.m4a_resampler) != MA_SUCCESS) { mh_seterr("unable to create M4A resampler"); mh_audio_stop(); return -1; }
+    g.m4a_resampler_init=1;
+    g.mode=3; g.ended=0; g.decoder_eof=0; g.frames_played=0; g.frames_written=0; g.track_start_frame=0; g.transition_armed=0; g.transitioned=0;
+    g.duration=mh_m4a_duration(g.m4a_decoder);
+    if (ma_pcm_rb_init(ma_format_f32,MH_CHANNELS,MH_FILE_RING_FRAMES,NULL,NULL,&g.ring)!=MA_SUCCESS) { mh_seterr("unable to create M4A read-ahead buffer"); mh_audio_stop(); return -1; }
+    g.ring_init=1;
+    g.decoder_thread_stop=0;
+    mh_setup_eq(eq_enabled,bass,lowmid,mid,highmid,treble);
+    if (mh_m4a_decode_to_ring(MH_FILE_PREFILL_FRAMES)!=0) { mh_seterr("unable to prefill M4A buffer"); mh_audio_stop(); return -1; }
+    if (!g.decoder_eof && mh_start_m4a_decoder_thread()!=0) { mh_audio_stop(); return -1; }
     if (mh_start_device()!=0) { mh_audio_stop(); return -1; }
     return 0;
 }
@@ -454,11 +530,29 @@ void mh_audio_set_eq(int enabled, float bass, float lowmid, float mid, float hig
 void mh_audio_pause(int paused) { g.paused=paused?1:0; }
 double mh_audio_position(void) { return (double)(g.frames_played-g.track_start_frame)/(double)MH_RATE; }
 double mh_audio_duration(void) {
-    return g.mode==1 ? g.duration : 0.0;
+    return (g.mode==1 || g.mode==3) ? g.duration : 0.0;
 }
 int mh_audio_seek(double seconds) {
-    if (g.mode != 1 || !g.decoder_init) return -1;
     if (seconds < 0) seconds = 0;
+    if (g.mode == 3 && g.m4a_decoder) {
+        int was_started = g.device_init;
+        int was_paused = g.paused;
+        if (was_started) ma_device_stop(&g.device);
+        mh_stop_decoder_thread();
+        if (g.ring_init) { ma_pcm_rb_uninit(&g.ring); g.ring_init=0; }
+        if (mh_m4a_seek(g.m4a_decoder, seconds) != 0) { if (was_started) ma_device_start(&g.device); return -1; }
+        if (g.m4a_resampler_init) { ma_resampler_uninit(&g.m4a_resampler, NULL); g.m4a_resampler_init=0; }
+        ma_resampler_config rc = ma_resampler_config_init(ma_format_f32, MH_CHANNELS, (ma_uint32)g.m4a_rate, MH_RATE, ma_resample_algorithm_linear);
+        if (ma_resampler_init(&rc, NULL, &g.m4a_resampler) != MA_SUCCESS) return -1;
+        g.m4a_resampler_init=1;
+        if (ma_pcm_rb_init(ma_format_f32,MH_CHANNELS,MH_FILE_RING_FRAMES,NULL,NULL,&g.ring)!=MA_SUCCESS) return -1;
+        g.ring_init=1; g.decoder_eof=0; g.ended=0; g.frames_played=(ma_uint64)(seconds*MH_RATE); g.frames_written=g.frames_played; g.track_start_frame=0; g.paused=was_paused;
+        if (mh_m4a_decode_to_ring(MH_FILE_PREFILL_FRAMES)!=0) return -1;
+        if (!g.decoder_eof && mh_start_m4a_decoder_thread()!=0) return -1;
+        if (was_started && ma_device_start(&g.device)!=MA_SUCCESS) return -1;
+        return 0;
+    }
+    if (g.mode != 1 || !g.decoder_init) return -1;
     ma_uint64 frame = (ma_uint64)(seconds * (double)MH_RATE);
     int was_started = g.device_init;
     int was_paused = g.paused;

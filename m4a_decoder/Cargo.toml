@@ -1,0 +1,19 @@
+[package]
+name = "misterhifi_m4a"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+libc = "0.2"
+symphonia = { version = "0.6.0", default-features = false, features = ["isomp4", "aac", "alac"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true

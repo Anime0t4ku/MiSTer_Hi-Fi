@@ -1,0 +1,6 @@
+dhowden/tag
+https://github.com/dhowden/tag
+License: BSD-2-Clause
+Used for MP4/M4A metadata and embedded artwork parsing.
+
+The dependency source and license are available from the project repository above.

@@ -26,6 +26,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	taglib "github.com/dhowden/tag"
 )
 
 const version = "1.2.0"
@@ -33,7 +35,7 @@ const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
 
-var supported = map[string]bool{".mp3": true, ".wav": true, ".flac": true, ".m3u": true, ".m3u8": true}
+var supported = map[string]bool{".mp3": true, ".wav": true, ".flac": true, ".m4a": true, ".m3u": true, ".m3u8": true}
 
 var swapABInput atomic.Bool
 var swapXYInput atomic.Bool
@@ -900,7 +902,7 @@ func audioFiles(dir string) []string {
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(x.Name()))
-		if ext == ".mp3" || ext == ".wav" || ext == ".flac" {
+		if ext == ".mp3" || ext == ".wav" || ext == ".flac" || ext == ".m4a" {
 			out = append(out, filepath.Join(dir, x.Name()))
 		}
 	}
@@ -1031,8 +1033,75 @@ func readBasicTags(t *Track) {
 	case ".wav":
 		t.MediaFormat = "WAV"
 		readWAVInfo(t)
+	case ".m4a":
+		t.MediaFormat = "M4A"
+		readM4AWithRetry(t)
 	}
 }
+func readM4AWithRetry(t *Track) {
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
+		candidate := *t
+		if readM4A(&candidate) {
+			*t = candidate
+			return
+		}
+		if attempt+1 < attempts {
+			time.Sleep(time.Duration(75*(attempt+1)) * time.Millisecond)
+		}
+	}
+}
+
+func readM4A(t *Track) bool {
+	ok := false
+	if codec, rate, bits, duration, err := nativeM4AProbeTrack(*t); err == nil {
+		if codec != "" {
+			t.MediaFormat = codec
+		}
+		if rate > 0 {
+			t.SampleRate = rate
+		}
+		if bits > 0 {
+			t.BitDepth = bits
+		}
+		if duration > 0 {
+			t.Duration = duration
+			if f, err := openTrackFile(*t); err == nil {
+				if st, statErr := f.Stat(); statErr == nil {
+					t.BitRate = int((float64(st.Size()) * 8 / duration / 1000) + 0.5)
+				}
+				_ = f.Close()
+			}
+		}
+		ok = true
+	}
+
+	f, err := openTrackFile(*t)
+	if err != nil {
+		return ok
+	}
+	defer f.Close()
+	m, err := taglib.ReadFrom(f)
+	if err != nil {
+		return ok
+	}
+	if v := strings.TrimSpace(m.Title()); v != "" {
+		t.Title = v
+	}
+	if v := strings.TrimSpace(m.Artist()); v != "" {
+		t.Artist = v
+	}
+	if v := strings.TrimSpace(m.Album()); v != "" {
+		t.Album = v
+	}
+	if p := m.Picture(); p != nil && len(p.Data) > 0 {
+		if im, _, err := image.Decode(bytes.NewReader(p.Data)); err == nil {
+			t.Art = im
+		}
+	}
+	return true
+}
+
 func syncSafeSize(b []byte) int {
 	if len(b) < 4 {
 		return 0
@@ -1250,6 +1319,161 @@ func readID3(t *Track) bool {
 	}
 	return true
 }
+func readFLACCoreWithRetry(t *Track) bool {
+	const attempts = 5
+	delays := [...]time.Duration{
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		350 * time.Millisecond,
+		500 * time.Millisecond,
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		candidate := *t
+		if readFLACCore(&candidate) {
+			*t = candidate
+			return true
+		}
+		if attempt+1 < attempts {
+			time.Sleep(delays[attempt])
+		}
+	}
+	return false
+}
+
+func readFLACCore(t *Track) bool {
+	f, e := openTrackFile(*t)
+	if e != nil {
+		return false
+	}
+	defer f.Close()
+
+	sig := make([]byte, 4)
+	if _, e = io.ReadFull(f, sig); e != nil || string(sig) != "fLaC" {
+		return false
+	}
+
+	gotStreamInfo := false
+	gotVorbis := false
+
+	for {
+		h := make([]byte, 4)
+		if _, e = io.ReadFull(f, h); e != nil {
+			return gotStreamInfo && gotVorbis
+		}
+
+		last := h[0]&0x80 != 0
+		typ := h[0] & 0x7f
+		n := int(h[1])<<16 | int(h[2])<<8 | int(h[3])
+		if n < 0 || n > 64*1024*1024 {
+			return gotStreamInfo && gotVorbis
+		}
+
+		switch typ {
+		case 0:
+			b := make([]byte, n)
+			if _, e = io.ReadFull(f, b); e != nil {
+				return gotStreamInfo && gotVorbis
+			}
+			if len(b) >= 34 {
+				x := binary.BigEndian.Uint64(b[10:18])
+				t.SampleRate = int((x >> 44) & 0xfffff)
+				t.BitDepth = int((x>>36)&0x1f) + 1
+				totalSamples := x & 0xfffffffff
+				if t.SampleRate > 0 && totalSamples > 0 {
+					t.Duration = float64(totalSamples) / float64(t.SampleRate)
+					if st, err := f.Stat(); err == nil && t.Duration > 0 {
+						t.BitRate = int((float64(st.Size()) * 8 / t.Duration / 1000) + 0.5)
+					}
+				}
+				gotStreamInfo = true
+			}
+		case 4:
+			b := make([]byte, n)
+			if _, e = io.ReadFull(f, b); e != nil {
+				return gotStreamInfo && gotVorbis
+			}
+			parseVorbis(t, b)
+			gotVorbis = true
+		default:
+			if _, e = f.Seek(int64(n), io.SeekCurrent); e != nil {
+				return gotStreamInfo && gotVorbis
+			}
+		}
+
+		if gotStreamInfo && gotVorbis {
+			return true
+		}
+		if last {
+			return gotStreamInfo && gotVorbis
+		}
+	}
+}
+
+func readFLACArtworkWithRetry(t *Track) image.Image {
+	const attempts = 4
+	delays := [...]time.Duration{
+		150 * time.Millisecond,
+		300 * time.Millisecond,
+		500 * time.Millisecond,
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		if im := readFLACArtwork(t); im != nil {
+			return im
+		}
+		if attempt+1 < attempts {
+			time.Sleep(delays[attempt])
+		}
+	}
+	return nil
+}
+
+func readFLACArtwork(t *Track) image.Image {
+	f, e := openTrackFile(*t)
+	if e != nil {
+		return nil
+	}
+	defer f.Close()
+
+	sig := make([]byte, 4)
+	if _, e = io.ReadFull(f, sig); e != nil || string(sig) != "fLaC" {
+		return nil
+	}
+
+	for {
+		h := make([]byte, 4)
+		if _, e = io.ReadFull(f, h); e != nil {
+			return nil
+		}
+		last := h[0]&0x80 != 0
+		typ := h[0] & 0x7f
+		n := int(h[1])<<16 | int(h[2])<<8 | int(h[3])
+		if n < 0 || n > 64*1024*1024 {
+			return nil
+		}
+
+		if typ == 6 {
+			b := make([]byte, n)
+			if _, e = io.ReadFull(f, b); e != nil {
+				return nil
+			}
+			tmp := *t
+			tmp.Art = nil
+			parseFlacPicture(&tmp, b)
+			if tmp.Art != nil {
+				return tmp.Art
+			}
+		} else {
+			if _, e = f.Seek(int64(n), io.SeekCurrent); e != nil {
+				return nil
+			}
+		}
+
+		if last {
+			return nil
+		}
+	}
+}
+
 func readFLACWithRetry(t *Track) {
 	const attempts = 3
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -1462,7 +1686,7 @@ func buildQueueFromChoice(choice browseChoice) Queue {
 			continue
 		}
 		e := strings.ToLower(filepath.Ext(x.Name()))
-		if e == ".mp3" || e == ".wav" || e == ".flac" {
+		if e == ".mp3" || e == ".wav" || e == ".flac" || e == ".m4a" {
 			names = append(names, x.Name())
 		}
 	}
@@ -1633,17 +1857,108 @@ type Player struct {
 func newPlayer(q Queue, cfg Config) *Player {
 	return &Player{q: q, cfg: cfg, stopped: true, gaplessQueuedIndex: -1}
 }
+func mergeTrackMetadata(dst *Track, src Track) {
+	if src.Title != "" {
+		dst.Title = src.Title
+	}
+	if src.Artist != "" {
+		dst.Artist = src.Artist
+	}
+	if src.Album != "" {
+		dst.Album = src.Album
+	}
+	if src.MediaFormat != "" && src.MediaFormat != "M4A" {
+		dst.MediaFormat = src.MediaFormat
+	}
+	if src.BitDepth > 0 {
+		dst.BitDepth = src.BitDepth
+	}
+	if src.SampleRate > 0 {
+		dst.SampleRate = src.SampleRate
+	}
+	if src.BitRate > 0 {
+		dst.BitRate = src.BitRate
+	}
+	if src.Duration > 0 {
+		dst.Duration = src.Duration
+	}
+	if src.Art != nil {
+		dst.Art = src.Art
+	}
+}
+
+func (p *Player) commitTrackMetadata(index int, path string, meta Track) {
+	p.mu.Lock()
+	if index >= 0 && index < len(p.q.Tracks) && p.q.Tracks[index].Path == path {
+		cur := p.q.Tracks[index]
+		mergeTrackMetadata(&cur, meta)
+		p.q.Tracks[index] = cur
+	}
+	p.mu.Unlock()
+}
+
 func (p *Player) loadCurrentMetadata(index int, src Track) {
 	if strings.HasPrefix(src.Path, "cdda:") {
 		return
 	}
-	go func() {
-		t := trackFromTrack(src)
-		p.mu.Lock()
-		if index >= 0 && index < len(p.q.Tracks) && p.q.Tracks[index].Path == src.Path {
-			p.q.Tracks[index] = t
+
+	ext := strings.ToLower(filepath.Ext(src.Path))
+
+	if ext == ".flac" {
+		meta := src
+		meta.MediaFormat = "FLAC"
+		if readFLACCoreWithRetry(&meta) {
+			p.commitTrackMetadata(index, src.Path, meta)
 		}
-		p.mu.Unlock()
+	}
+
+	if ext == ".m4a" {
+		if codec, rate, bits, duration, err := nativeM4AProbeTrack(src); err == nil {
+			meta := src
+			if codec != "" {
+				meta.MediaFormat = codec
+			}
+			if rate > 0 {
+				meta.SampleRate = rate
+			}
+			if bits > 0 {
+				meta.BitDepth = bits
+			}
+			if duration > 0 {
+				meta.Duration = duration
+				if f, openErr := openTrackFile(meta); openErr == nil {
+					if st, statErr := f.Stat(); statErr == nil {
+						meta.BitRate = int((float64(st.Size()) * 8 / duration / 1000) + 0.5)
+					}
+					_ = f.Close()
+				}
+			}
+			p.commitTrackMetadata(index, src.Path, meta)
+		}
+	}
+
+	go func() {
+		t := src
+		if ext == ".flac" {
+			if t.Art == nil {
+				t.Art = readFLACArtworkWithRetry(&t)
+			}
+			if t.Art == nil {
+				for attempt := 0; attempt < 3 && t.Art == nil; attempt++ {
+					if t.UseDirFD && t.DirFD >= 0 {
+						t.Art = folderArtworkAt(t.DirFD)
+					} else {
+						t.Art = folderArtwork(filepath.Dir(t.Path))
+					}
+					if t.Art == nil && attempt < 2 {
+						time.Sleep(time.Duration(150*(attempt+1)) * time.Millisecond)
+					}
+				}
+			}
+		} else {
+			t = trackFromTrack(src)
+		}
+		p.commitTrackMetadata(index, src.Path, t)
 	}()
 }
 func (p *Player) current() *Track {

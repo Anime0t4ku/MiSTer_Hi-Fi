@@ -25,3 +25,7 @@ func nativeAudioDuration() float64   { return 0 }
 func nativeAudioSeek(float64) error  { return nil }
 func nativeAudioEnded() bool         { return false }
 func nativeAudioLevels() [10]float64 { return [10]float64{} }
+
+func nativeM4AProbeTrack(t Track) (string, int, int, float64, error) {
+	return "M4A", 0, 0, 0, errors.New("M4A decoding unavailable")
+}
