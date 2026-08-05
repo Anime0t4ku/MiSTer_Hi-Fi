@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.3.1"
+const version = "1.4.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -1882,6 +1882,7 @@ func externalListener(ch chan<- string) (net.Listener, error) {
 }
 
 type Player struct {
+	opMu               sync.Mutex
 	mu                 sync.Mutex
 	q                  Queue
 	paused             bool
@@ -1892,6 +1893,7 @@ type Player struct {
 	cfg                Config
 	gaplessQueuedIndex int
 	streamCancel       func()
+	generation         uint64
 }
 
 func newPlayer(q Queue, cfg Config) *Player {
@@ -2073,6 +2075,12 @@ func (p *Player) prepareGaplessNextFile() {
 }
 
 func (p *Player) handleGaplessTransition() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.handleGaplessTransitionUnlocked()
+}
+
+func (p *Player) handleGaplessTransitionUnlocked() {
 	p.mu.Lock()
 	nextIndex := p.gaplessQueuedIndex
 	if nextIndex < 0 || nextIndex >= len(p.q.Tracks) {
@@ -2093,7 +2101,13 @@ func (p *Player) handleGaplessTransition() {
 }
 
 func (p *Player) playCurrent() error {
-	p.stopPlaybackRaw()
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	return p.playCurrentUnlocked()
+}
+
+func (p *Player) playCurrentUnlocked() error {
+	p.stopPlaybackRawUnlocked()
 	p.mu.Lock()
 	if p.q.Index < 0 || p.q.Index >= len(p.q.Tracks) {
 		p.mu.Unlock()
@@ -2104,6 +2118,8 @@ func (p *Player) playCurrent() error {
 	cfg := p.cfg
 	stop := make(chan struct{})
 	p.stop = stop
+	p.generation++
+	generation := p.generation
 	p.paused = false
 	p.stopped = false
 	p.basePosition = 0
@@ -2142,10 +2158,10 @@ func (p *Player) playCurrent() error {
 	if !strings.HasPrefix(t.Path, "cdda:") && !isHTTPURL(t.Path) {
 		p.prepareGaplessNextFile()
 	}
-	go p.monitorPlayback(stop)
+	go p.monitorPlayback(stop, generation)
 	return nil
 }
-func (p *Player) monitorPlayback(stop <-chan struct{}) {
+func (p *Player) monitorPlayback(stop <-chan struct{}, generation uint64) {
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
 	for {
@@ -2153,17 +2169,29 @@ func (p *Player) monitorPlayback(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-t.C:
+			p.opMu.Lock()
+			p.mu.Lock()
+			current := p.stop == stop && p.generation == generation && !p.stopped
+			p.mu.Unlock()
+			if !current {
+				p.opMu.Unlock()
+				return
+			}
 			lv := nativeAudioLevels()
+			transition := nativeAudioTakeTransition()
+			ended := nativeAudioEnded()
 			p.mu.Lock()
 			p.levels = lv
 			p.mu.Unlock()
-			if nativeAudioTakeTransition() {
-				p.handleGaplessTransition()
+			if transition {
+				p.handleGaplessTransitionUnlocked()
 			}
-			if nativeAudioEnded() {
-				p.advance()
+			if ended {
+				p.advanceUnlocked(generation, stop)
+				p.opMu.Unlock()
 				return
 			}
+			p.opMu.Unlock()
 		}
 	}
 }
@@ -2290,7 +2318,14 @@ func (p *Player) playCDTrack(t Track, stop <-chan struct{}) error {
 }
 
 func (p *Player) stopPlaybackRaw() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.stopPlaybackRawUnlocked()
+}
+
+func (p *Player) stopPlaybackRawUnlocked() {
 	p.mu.Lock()
+	p.generation++
 	cancel := p.streamCancel
 	p.streamCancel = nil
 	if p.stop != nil {
@@ -2308,7 +2343,13 @@ func (p *Player) stopPlaybackRaw() {
 	nativeAudioStop()
 }
 func (p *Player) stopAndReset() {
-	p.stopPlaybackRaw()
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.stopAndResetUnlocked()
+}
+
+func (p *Player) stopAndResetUnlocked() {
+	p.stopPlaybackRawUnlocked()
 	p.mu.Lock()
 	p.paused = false
 	p.stopped = true
@@ -2336,7 +2377,21 @@ func (a *App) stopAndUnload() {
 	closeQueueDirFD(&p.q)
 }
 func (p *Player) advance() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
 	p.mu.Lock()
+	generation := p.generation
+	stop := p.stop
+	p.mu.Unlock()
+	p.advanceUnlocked(generation, stop)
+}
+
+func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
+	p.mu.Lock()
+	if p.generation != generation || p.stop != stop || p.stopped {
+		p.mu.Unlock()
+		return
+	}
 	if len(p.q.Tracks) == 0 {
 		p.mu.Unlock()
 		return
@@ -2353,25 +2408,35 @@ func (p *Player) advance() {
 		p.q.Index++
 	} else {
 		p.stop = nil
+		p.generation++
 		p.paused = false
 		p.stopped = true
 		p.levels = [10]float64{}
+		cancel := p.streamCancel
+		p.streamCancel = nil
 		p.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 		nativeAudioStop()
 		return
 	}
 	p.mu.Unlock()
-	_ = p.playCurrent()
+	_ = p.playCurrentUnlocked()
 }
 func (p *Player) prev() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
 	p.mu.Lock()
 	if len(p.q.Tracks) > 0 {
 		p.q.Index = (p.q.Index - 1 + len(p.q.Tracks)) % len(p.q.Tracks)
 	}
 	p.mu.Unlock()
-	_ = p.playCurrent()
+	_ = p.playCurrentUnlocked()
 }
 func (p *Player) next() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
 	p.mu.Lock()
 	if len(p.q.Tracks) > 0 {
 		if p.q.Shuffle && len(p.q.Tracks) > 1 {
@@ -2386,15 +2451,17 @@ func (p *Player) next() {
 		}
 	}
 	p.mu.Unlock()
-	_ = p.playCurrent()
+	_ = p.playCurrentUnlocked()
 }
 func (p *Player) togglePause() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
 	p.mu.Lock()
 	stopped := p.stopped
 	paused := p.paused
 	p.mu.Unlock()
 	if stopped {
-		_ = p.playCurrent()
+		_ = p.playCurrentUnlocked()
 		return
 	}
 	paused = !paused
@@ -2404,6 +2471,8 @@ func (p *Player) togglePause() {
 	nativeAudioPause(paused)
 }
 func (p *Player) seekBy(seconds float64) {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
 	p.mu.Lock()
 	if p.stopped || p.q.Index < 0 || p.q.Index >= len(p.q.Tracks) {
 		p.mu.Unlock()
@@ -2425,19 +2494,21 @@ func (p *Player) seekBy(seconds float64) {
 		_ = nativeAudioSeek(target)
 		return
 	}
-	p.stopPlaybackRaw()
+	p.stopPlaybackRawUnlocked()
 	stop := make(chan struct{})
 	p.mu.Lock()
 	p.stop = stop
+	p.generation++
+	generation := p.generation
 	p.paused = false
 	p.stopped = false
 	p.basePosition = target
 	p.mu.Unlock()
 	if err := p.playCDTrack(t, stop); err != nil {
-		p.stopAndReset()
+		p.stopAndResetUnlocked()
 		return
 	}
-	go p.monitorPlayback(stop)
+	go p.monitorPlayback(stop, generation)
 }
 func (p *Player) elapsedNow() time.Duration {
 	p.mu.Lock()

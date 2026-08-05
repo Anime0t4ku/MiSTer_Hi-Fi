@@ -22,10 +22,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
+var nativeAudioControlMu sync.Mutex
+
 func nativeAudioStartTrack(t Track, eq EQConfig) error {
+	nativeAudioControlMu.Lock()
+	defer nativeAudioControlMu.Unlock()
 	f, err := openTrackFile(t)
 	if err != nil {
 		return err
@@ -70,15 +75,19 @@ func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
 	br := bufio.NewReaderSize(resp.Body, 16384)
 	probe, _ := br.Peek(8192)
 	encoding := radioEncodingHint(probe, resp.Header.Get("Content-Type"), rawURL)
-	if encoding < 0 {
+	switch encoding {
+	case 6:
 		resp.Body.Close()
 		cancel()
-		return nil, errors.New("unsupported radio codec")
-	}
-	if encoding == 0 {
+		return nil, errors.New("AAC/AAC+ radio streams are not supported")
+	case 7:
 		resp.Body.Close()
 		cancel()
-		return nil, errors.New("unable to identify radio codec")
+		return nil, errors.New("Opus radio streams are not supported")
+	case 0:
+		resp.Body.Close()
+		cancel()
+		return nil, errors.New("unsupported or unrecognized radio stream format")
 	}
 	if encoding == 2 {
 		if off := firstMP3FrameOffset(probe); off > 0 {
@@ -104,7 +113,9 @@ func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
 	if eq.Enabled {
 		enabled = 1
 	}
+	nativeAudioControlMu.Lock()
 	rc := C.mh_audio_start_stream_fd(C.int(r.Fd()), C.int(encoding), enabled, C.float(eq.Bass), C.float(eq.LowMid), C.float(eq.Mid), C.float(eq.HighMid), C.float(eq.Treble))
+	nativeAudioControlMu.Unlock()
 	_ = r.Close()
 	if rc != 0 {
 		cancel()
@@ -136,63 +147,51 @@ func firstMP3FrameOffset(b []byte) int {
 	return -1
 }
 
-func looksLikeADTS(b []byte) bool {
-	if len(b) < 2 {
-		return false
-	}
-	return b[0] == 0xff && (b[1]&0xf6) == 0xf0
-}
-
-func looksLikeMP3Frame(b []byte) bool {
-	if len(b) < 4 || b[0] != 0xff || (b[1]&0xe0) != 0xe0 {
-		return false
-	}
-	version := (b[1] >> 3) & 0x03
-	layer := (b[1] >> 1) & 0x03
-	bitrate := (b[2] >> 4) & 0x0f
-	sampleRate := (b[2] >> 2) & 0x03
-	return version != 1 && layer != 0 && bitrate != 0 && bitrate != 0x0f && sampleRate != 3
-}
-
 func radioEncodingHint(probe []byte, contentType, rawURL string) int {
 	lowerProbe := bytes.ToLower(probe)
 	ct := strings.ToLower(contentType)
 	u := strings.ToLower(rawURL)
 
-	if strings.Contains(ct, "aac") || strings.Contains(ct, "aacp") || looksLikeADTS(probe) {
-		return -1
+	if bytes.HasPrefix(probe, []byte("fLaC")) {
+		return 1
 	}
 	if bytes.HasPrefix(probe, []byte("OggS")) {
-		if bytes.Contains(probe, []byte("OpusHead")) {
-			return -1
-		}
 		if bytes.Contains(probe, []byte("fLaC")) || bytes.Contains(probe, []byte("FLAC")) {
 			return 5
 		}
 		if bytes.Contains(lowerProbe, []byte("vorbis")) {
 			return 3
 		}
+		if bytes.Contains(probe, []byte("OpusHead")) {
+			return 7
+		}
 	}
-	if bytes.HasPrefix(probe, []byte("fLaC")) || bytes.Contains(probe, []byte("fLaC")) {
+	if bytes.Contains(lowerProbe, []byte("vorbis")) {
+		return 3
+	}
+	if bytes.Contains(probe, []byte("fLaC")) {
 		return 1
 	}
 	if bytes.HasPrefix(probe, []byte("RIFF")) && len(probe) >= 12 && string(probe[8:12]) == "WAVE" {
 		return 4
 	}
-	if bytes.HasPrefix(probe, []byte("ID3")) || looksLikeMP3Frame(probe) {
-		return 2
+	if looksLikeADTS(probe) {
+		return 6
 	}
-	if bytes.Contains(lowerProbe, []byte("vorbis")) {
-		return 3
+	if bytes.HasPrefix(probe, []byte("ID3")) || firstMP3FrameOffset(probe) >= 0 {
+		return 2
 	}
 	if strings.Contains(ct, "flac") || strings.Contains(u, ".flac") || strings.HasSuffix(u, "/flac") {
 		return 1
 	}
+	if strings.Contains(ct, "aac") || strings.Contains(ct, "aacp") || strings.Contains(u, ".aac") {
+		return 6
+	}
+	if strings.Contains(ct, "opus") || strings.Contains(u, ".opus") {
+		return 7
+	}
 	if strings.Contains(ct, "mpeg") || strings.Contains(ct, "mp3") || strings.Contains(u, ".mp3") {
 		return 2
-	}
-	if strings.Contains(ct, "opus") {
-		return -1
 	}
 	if strings.Contains(ct, "vorbis") || strings.Contains(u, ".ogg") || strings.Contains(u, ".oga") {
 		return 3
@@ -203,7 +202,26 @@ func radioEncodingHint(probe []byte, contentType, rawURL string) int {
 	return 0
 }
 
+func looksLikeADTS(b []byte) bool {
+	for i := 0; i+7 <= len(b); i++ {
+		if b[i] != 0xff || (b[i+1]&0xf6) != 0xf0 {
+			continue
+		}
+		sampleRateIndex := (b[i+2] >> 2) & 0x0f
+		if sampleRateIndex == 0x0f {
+			continue
+		}
+		frameLength := int(b[i+3]&0x03)<<11 | int(b[i+4])<<3 | int((b[i+5]>>5)&0x07)
+		if frameLength >= 7 {
+			return true
+		}
+	}
+	return false
+}
+
 func nativeAudioStartPCM(eq EQConfig) error {
+	nativeAudioControlMu.Lock()
+	defer nativeAudioControlMu.Unlock()
 	enabled := C.int(0)
 	if eq.Enabled {
 		enabled = 1
@@ -215,6 +233,8 @@ func nativeAudioStartPCM(eq EQConfig) error {
 }
 
 func nativeAudioQueueNextTrack(t Track) error {
+	nativeAudioControlMu.Lock()
+	defer nativeAudioControlMu.Unlock()
 	f, err := openTrackFile(t)
 	if err != nil {
 		return err
@@ -227,6 +247,8 @@ func nativeAudioQueueNextTrack(t Track) error {
 }
 
 func nativeAudioMarkPCMTransition(nextDuration float64) error {
+	nativeAudioControlMu.Lock()
+	defer nativeAudioControlMu.Unlock()
 	if C.mh_audio_mark_pcm_transition(C.double(nextDuration)) != 0 {
 		return errors.New("unable to queue gapless CD transition")
 	}
@@ -246,7 +268,11 @@ func nativeAudioWritePCM(b []byte) error {
 }
 
 func nativeAudioFinishPCM() { C.mh_audio_finish_pcm() }
-func nativeAudioStop()      { C.mh_audio_stop() }
+func nativeAudioStop() {
+	nativeAudioControlMu.Lock()
+	defer nativeAudioControlMu.Unlock()
+	C.mh_audio_stop()
+}
 
 func nativeAudioSetEQ(eq EQConfig) {
 	enabled := C.int(0)
@@ -267,6 +293,8 @@ func nativeAudioPause(paused bool) {
 func nativeAudioPosition() float64 { return float64(C.mh_audio_position()) }
 func nativeAudioDuration() float64 { return float64(C.mh_audio_duration()) }
 func nativeAudioSeek(seconds float64) error {
+	nativeAudioControlMu.Lock()
+	defer nativeAudioControlMu.Unlock()
 	if C.mh_audio_seek(C.double(seconds)) != 0 {
 		return errors.New("unable to seek audio")
 	}
