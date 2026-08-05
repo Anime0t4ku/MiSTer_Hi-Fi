@@ -28,7 +28,7 @@ import (
 	"unsafe"
 )
 
-const version = "1.1.1"
+const version = "1.2.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -928,6 +928,7 @@ func openTrackFile(t Track) (*os.File, error) {
 	}
 	return os.Open(t.Path)
 }
+
 var folderArtworkNames = []string{
 	"cover.jpg", "cover.jpeg", "cover.png",
 	"folder.jpg", "folder.jpeg", "folder.png",
@@ -1022,11 +1023,11 @@ func readBasicTags(t *Track) {
 	switch ext {
 	case ".mp3":
 		t.MediaFormat = "MP3"
-		readMP3Info(t)
-		readID3(t)
+		readMP3InfoWithRetry(t)
+		readID3WithRetry(t)
 	case ".flac":
 		t.MediaFormat = "FLAC"
-		readFLAC(t)
+		readFLACWithRetry(t)
 	case ".wav":
 		t.MediaFormat = "WAV"
 		readWAVInfo(t)
@@ -1039,10 +1040,25 @@ func syncSafeSize(b []byte) int {
 	return int(b[0]&0x7f)<<21 | int(b[1]&0x7f)<<14 | int(b[2]&0x7f)<<7 | int(b[3]&0x7f)
 }
 
-func readMP3Info(t *Track) {
+func readMP3InfoWithRetry(t *Track) {
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
+		candidate := *t
+		if readMP3Info(&candidate) {
+			t.SampleRate = candidate.SampleRate
+			t.BitRate = candidate.BitRate
+			return
+		}
+		if attempt+1 < attempts {
+			time.Sleep(time.Duration(75*(attempt+1)) * time.Millisecond)
+		}
+	}
+}
+
+func readMP3Info(t *Track) bool {
 	f, e := openTrackFile(*t)
 	if e != nil {
-		return
+		return false
 	}
 	defer f.Close()
 	var offset int64
@@ -1054,10 +1070,16 @@ func readMP3Info(t *Track) {
 		}
 	}
 	if _, e = f.Seek(offset, io.SeekStart); e != nil {
-		return
+		return false
 	}
-	buf := make([]byte, 64*1024)
-	n, _ := f.Read(buf)
+	buf := make([]byte, 256*1024)
+	n, readErr := f.Read(buf)
+	if n <= 0 {
+		return false
+	}
+	if readErr != nil && readErr != io.EOF {
+		return false
+	}
 	buf = buf[:n]
 	bitratesMPEG1L3 := [...]int{0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0}
 	bitratesMPEG2L3 := [...]int{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}
@@ -1081,14 +1103,20 @@ func readMP3Info(t *Track) {
 		case 0:
 			rate /= 4
 		}
-		t.SampleRate = rate
+		bitrate := 0
 		if versionID == 3 {
-			t.BitRate = bitratesMPEG1L3[bitrateIndex]
+			bitrate = bitratesMPEG1L3[bitrateIndex]
 		} else {
-			t.BitRate = bitratesMPEG2L3[bitrateIndex]
+			bitrate = bitratesMPEG2L3[bitrateIndex]
 		}
-		return
+		if rate <= 0 || bitrate <= 0 {
+			continue
+		}
+		t.SampleRate = rate
+		t.BitRate = bitrate
+		return true
 	}
+	return false
 }
 
 func readWAVInfo(t *Track) {
@@ -1147,15 +1175,37 @@ func readWAVInfo(t *Track) {
 	}
 }
 
-func readID3(t *Track) {
+func readID3WithRetry(t *Track) {
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
+		candidate := *t
+		if readID3(&candidate) {
+			t.Title = candidate.Title
+			t.Artist = candidate.Artist
+			t.Album = candidate.Album
+			if candidate.Art != nil {
+				t.Art = candidate.Art
+			}
+			return
+		}
+		if attempt+1 < attempts {
+			time.Sleep(time.Duration(75*(attempt+1)) * time.Millisecond)
+		}
+	}
+}
+
+func readID3(t *Track) bool {
 	f, e := openTrackFile(*t)
 	if e != nil {
-		return
+		return false
 	}
 	defer f.Close()
 	h := make([]byte, 10)
-	if _, e = io.ReadFull(f, h); e != nil || string(h[:3]) != "ID3" {
-		return
+	if _, e = io.ReadFull(f, h); e != nil {
+		return false
+	}
+	if string(h[:3]) != "ID3" {
+		return true
 	}
 	sz := int(h[6]&0x7f)<<21 | int(h[7]&0x7f)<<14 | int(h[8]&0x7f)<<7 | int(h[9]&0x7f)
 	data := make([]byte, sz)
@@ -1198,28 +1248,46 @@ func readID3(t *Track) {
 		}
 		i += 10 + n
 	}
+	return true
 }
-func readFLAC(t *Track) {
+func readFLACWithRetry(t *Track) {
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
+		candidate := *t
+		if readFLAC(&candidate) {
+			*t = candidate
+			return
+		}
+		if attempt+1 < attempts {
+			time.Sleep(time.Duration(75*(attempt+1)) * time.Millisecond)
+		}
+	}
+}
+
+func readFLAC(t *Track) bool {
 	f, e := openTrackFile(*t)
 	if e != nil {
-		return
+		return false
 	}
 	defer f.Close()
 	sig := make([]byte, 4)
 	if _, e = io.ReadFull(f, sig); e != nil || string(sig) != "fLaC" {
-		return
+		return false
 	}
 	for {
 		h := make([]byte, 4)
 		if _, e = io.ReadFull(f, h); e != nil {
-			return
+			return false
 		}
 		last := h[0]&0x80 != 0
 		typ := h[0] & 0x7f
 		n := int(h[1])<<16 | int(h[2])<<8 | int(h[3])
+		if n < 0 || n > 64*1024*1024 {
+			return false
+		}
 		b := make([]byte, n)
 		if _, e = io.ReadFull(f, b); e != nil {
-			return
+			return false
 		}
 		if typ == 0 && len(b) >= 34 {
 			x := binary.BigEndian.Uint64(b[10:18])
@@ -1240,10 +1308,11 @@ func readFLAC(t *Track) {
 			parseFlacPicture(t, b)
 		}
 		if last {
-			return
+			return true
 		}
 	}
 }
+
 func parseVorbis(t *Track, b []byte) {
 	if len(b) < 8 {
 		return
@@ -3065,7 +3134,8 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 
 func playerTrackKey(p *Player) string {
 	t, _, idx, _, paused, rep, shuf, stopped := playerSnapshot(p)
-	return fmt.Sprintf("%d|%s|%s|%s|%t|%t|%t|%t", idx, t.Title, t.Artist, t.Album, t.Art != nil, paused, rep || shuf, stopped)
+	return fmt.Sprintf("%d|%s|%s|%s|%s|%d|%d|%d|%.3f|%t|%t|%t|%t",
+		idx, t.Title, t.Artist, t.Album, t.MediaFormat, t.BitDepth, t.SampleRate, t.BitRate, t.Duration, t.Art != nil, paused, rep || shuf, stopped)
 }
 
 func playerUI(app *App) {

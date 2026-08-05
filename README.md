@@ -358,6 +358,8 @@ The GPLv3 license applies to MiSTer Hi-Fi's own source code and does not replace
 
 ## Known Issues
 
+- Special characters in file or track names are not fully supported yet and may prevent affected tracks from playing. This will be addressed in a future update.
+
 - Zaparoo's **HOLD** mode is currently not compatible with MiSTer Hi-Fi.
 - While MiSTer Hi-Fi is active, Zaparoo cannot process another NFC scan.
 
@@ -372,3 +374,7 @@ MiSTer Hi-Fi uses [`stb_truetype`](https://github.com/nothings/stb) to parse and
 MiSTer Hi-Fi does not include or distribute custom font files. Users may place their own compatible `.ttf` or `.otf` fonts in the automatically created `fonts` folder. Users are responsible for ensuring they have permission to use any font files they add.
 
 The built-in MiSTer Hi-Fi bitmap font remains the default and primary UI font. Custom fallback glyphs are automatically rendered slightly larger (about 175% of the built-in bitmap font's nominal pixel height) to better match its visual size, while still scaling proportionally with MiSTer Hi-Fi's existing text sizes and layout. A selected custom font is used only for characters that are not available in the built-in font, while MiSTer Hi-Fi continues to control font sizing and layout.
+
+### v1.2.0 metadata reliability
+
+FLAC metadata loading now retries short-lived file read/open failures and only applies parsed metadata after a complete successful metadata pass. This improves metadata reliability on slower or network-backed storage without delaying audio playback.
