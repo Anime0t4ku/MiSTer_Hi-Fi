@@ -28,7 +28,7 @@ import (
 	"unsafe"
 )
 
-const version = "1.1.0"
+const version = "1.1.1"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -928,6 +928,12 @@ func openTrackFile(t Track) (*os.File, error) {
 	}
 	return os.Open(t.Path)
 }
+var folderArtworkNames = []string{
+	"cover.jpg", "cover.jpeg", "cover.png",
+	"folder.jpg", "folder.jpeg", "folder.png",
+	"front.jpg", "front.jpeg", "front.png",
+}
+
 func folderArtwork(dir string) image.Image {
 	es, e := os.ReadDir(dir)
 	if e != nil {
@@ -940,15 +946,51 @@ func folderArtwork(dir string) image.Image {
 		}
 		byName[strings.ToLower(x.Name())] = x.Name()
 	}
-	for _, n := range []string{
-		"cover.jpg", "cover.jpeg", "cover.png",
-		"folder.jpg", "folder.jpeg", "folder.png",
-		"front.jpg", "front.jpeg", "front.png",
-	} {
+	for _, n := range folderArtworkNames {
 		if actual, ok := byName[n]; ok {
 			if im := loadImg(filepath.Join(dir, actual)); im != nil {
 				return im
 			}
+		}
+	}
+	return nil
+}
+
+func folderArtworkAt(dirFD int) image.Image {
+	if dirFD < 0 {
+		return nil
+	}
+	scanFD, err := syscall.Openat(dirFD, ".", syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil
+	}
+	df := os.NewFile(uintptr(scanFD), ".")
+	entries, err := df.ReadDir(-1)
+	_ = df.Close()
+	if err != nil {
+		return nil
+	}
+	byName := make(map[string]string, len(entries))
+	for _, x := range entries {
+		if x.IsDir() {
+			continue
+		}
+		byName[strings.ToLower(x.Name())] = x.Name()
+	}
+	for _, n := range folderArtworkNames {
+		actual, ok := byName[n]
+		if !ok {
+			continue
+		}
+		fd, err := syscall.Openat(dirFD, actual, syscall.O_RDONLY, 0)
+		if err != nil {
+			continue
+		}
+		f := os.NewFile(uintptr(fd), actual)
+		im, _, decErr := image.Decode(f)
+		_ = f.Close()
+		if decErr == nil {
+			return im
 		}
 	}
 	return nil
@@ -966,8 +1008,12 @@ func trackFromPath(p string) Track {
 func trackFromTrack(src Track) Track {
 	t := src
 	readBasicTags(&t)
-	if t.Art == nil && !t.UseDirFD {
-		t.Art = folderArtwork(filepath.Dir(t.Path))
+	if t.Art == nil {
+		if t.UseDirFD && t.DirFD >= 0 {
+			t.Art = folderArtworkAt(t.DirFD)
+		} else {
+			t.Art = folderArtwork(filepath.Dir(t.Path))
+		}
 	}
 	return t
 }
