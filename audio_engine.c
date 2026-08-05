@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
 
 #define MH_RATE 44100
 #define MH_CHANNELS 2
@@ -25,6 +26,8 @@
 #define MH_FILE_PREFILL_FRAMES 2048
 #define MH_FILE_DECODE_CHUNK 4096
 #define MH_STREAM_REPLAY_BYTES (256 * 1024)
+#define MH_STREAM_POLL_MS 250
+#define MH_STREAM_STALL_TIMEOUT_MS 15000
 #define MH_PI 3.14159265358979323846
 
 typedef struct {
@@ -117,8 +120,29 @@ static size_t mh_source_read(mh_fd_source* src, void* pBufferOut, size_t bytesTo
             continue;
         }
 
-        ssize_t n;
-        do { n = read(src->fd, out + done, bytesToRead - done); } while (n < 0 && errno == EINTR);
+        int waited_ms = 0;
+        ssize_t n = -1;
+        for (;;) {
+            if (g.decoder_thread_stop) return done;
+            struct pollfd pfd;
+            pfd.fd = src->fd;
+            pfd.events = POLLIN | POLLHUP | POLLERR;
+            pfd.revents = 0;
+            int pr;
+            do { pr = poll(&pfd, 1, MH_STREAM_POLL_MS); } while (pr < 0 && errno == EINTR);
+            if (pr < 0) return done;
+            if (pr == 0) {
+                waited_ms += MH_STREAM_POLL_MS;
+                if (waited_ms >= MH_STREAM_STALL_TIMEOUT_MS) return done;
+                continue;
+            }
+            if (pfd.revents & POLLNVAL) return done;
+            do { n = read(src->fd, out + done, bytesToRead - done); } while (n < 0 && errno == EINTR);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            break;
+        }
         if (n <= 0) break;
 
         if (src->physical_pos < src->replay_cap) {
