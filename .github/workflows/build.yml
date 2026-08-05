@@ -26,14 +26,28 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install ARM Cross Compiler
+      - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf zip
+          sudo apt-get install -y curl xz-utils zip file
+
+      - name: Install ARM GCC 10.2 Toolchain
+        run: |
+          curl -L \
+            "https://developer.arm.com/-/media/Files/downloads/gnu-a/10.2-2020.11/binrel/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf.tar.xz" \
+            -o /tmp/gcc-arm.tar.xz
+
+          sudo tar -xJf /tmp/gcc-arm.tar.xz -C /opt
+
+          echo "/opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/bin" >> "$GITHUB_PATH"
+
+      - name: Verify ARM Toolchain
+        run: |
+          /opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/bin/arm-none-linux-gnueabihf-gcc --version
 
       - name: Build MiSTer Hi-Fi
         env:
-          CC: arm-linux-gnueabihf-gcc
+          CC: arm-none-linux-gnueabihf-gcc
         run: |
           chmod +x fetch_miniaudio.sh build-mister.sh
           ./build-mister.sh
@@ -42,6 +56,7 @@ jobs:
         run: |
           test -f Scripts/.config/MiSTerHiFi/mister_hifi
           file Scripts/.config/MiSTerHiFi/mister_hifi
+          arm-none-linux-gnueabihf-readelf -V Scripts/.config/MiSTerHiFi/mister_hifi
 
       - name: Package MiSTer Hi-Fi
         run: |
@@ -57,8 +72,7 @@ jobs:
   release:
     name: Create / Update Pre-release
     runs-on: ubuntu-latest
-    needs:
-      - build
+    needs: build
     if: github.ref == 'refs/heads/main'
 
     steps:
