@@ -255,6 +255,25 @@ Physical Audio CDs are shown as `CDDA`, `16 bit`, `44.1 kHz` and `1411 kbps`.
 - **Screensaver** can turn the display completely black after 30 seconds, 1 minute, 2 minutes, 5 minutes, or 10 minutes of inactivity. Any controller or keyboard input wakes the display and the wake input is consumed. The screensaver is Off by default.
 - **Gapless Playback (Experimental)** enables seamless natural track-to-track transitions for FLAC, WAV and physical Audio CD (CDDA) playback. MP3 is intentionally excluded. The setting is Off by default.
 - **Swap A/B** and **Swap X/Y** change physical controller behavior without changing the on-screen button labels.
+- **Custom Fallback Font** optionally uses a user-provided `.ttf` or compatible `.otf` font only for characters that are not available in MiSTer Hi-Fi's built-in bitmap font. The built-in font remains the primary font. The setting is Off by default and is disabled when no valid custom fonts are found.
+
+## Custom Fallback Fonts
+
+MiSTer Hi-Fi automatically creates:
+
+```text
+/media/fat/Scripts/.config/MiSTerHiFi/fonts/
+```
+
+Place user-provided `.ttf` or compatible `.otf` font files in this folder. Valid fonts appear automatically under **Settings > Custom Fallback Font** using the font filename without its extension.
+
+Custom Fallback Font defaults to **Off**. When the folder contains no valid fonts, the setting is greyed out. If a previously selected font is removed, MiSTer Hi-Fi safely falls back to Off.
+
+The custom font does not replace MiSTer Hi-Fi's built-in bitmap font. It is used only as a fallback for characters the built-in font cannot display, such as Japanese or accented characters. Fallback glyphs inherit the existing MiSTer Hi-Fi text scale, line layout, clipping and alignment rather than introducing a separate user-controlled font size.
+
+No fonts are included with MiSTer Hi-Fi. Users are responsible for ensuring they have permission to use any font files they add.
+
+MiSTer Hi-Fi uses `stb_truetype` to rasterize supported user fonts. Its license is included in the source repository under `licenses/stb-LICENSE.txt`.
 
 ## Equalizer
 
@@ -281,6 +300,7 @@ OLED Mode
 Show Album Art
 Swap A/B
 Swap X/Y
+Custom Fallback Font
 ```
 
 **OLED Mode** changes the main application background from dark grey to true black.
@@ -338,11 +358,17 @@ The GPLv3 license applies to MiSTer Hi-Fi's own source code and does not replace
 
 ## Known Issues
 
-- Special characters in file or track names are not fully supported yet and may prevent affected tracks from playing. This will be addressed in a future update.
-
 - Zaparoo's **HOLD** mode is currently not compatible with MiSTer Hi-Fi.
 - While MiSTer Hi-Fi is active, Zaparoo cannot process another NFC scan.
 
 ## Notes
 
 MiSTer Hi-Fi does not include music files or album artwork.
+
+## Custom Fallback Font Rendering and Third-Party Code
+
+MiSTer Hi-Fi uses [`stb_truetype`](https://github.com/nothings/stb) to parse and rasterize user-provided TrueType/OpenType fonts for the optional custom fallback font feature. `stb_truetype` is third-party code and is distributed under its own license, included in the repository's `licenses` folder.
+
+MiSTer Hi-Fi does not include or distribute custom font files. Users may place their own compatible `.ttf` or `.otf` fonts in the automatically created `fonts` folder. Users are responsible for ensuring they have permission to use any font files they add.
+
+The built-in MiSTer Hi-Fi bitmap font remains the default and primary UI font. Custom fallback glyphs are automatically rendered slightly larger (about 175% of the built-in bitmap font's nominal pixel height) to better match its visual size, while still scaling proportionally with MiSTer Hi-Fi's existing text sizes and layout. A selected custom font is used only for characters that are not available in the built-in font, while MiSTer Hi-Fi continues to control font sizing and layout.

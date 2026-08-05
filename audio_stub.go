@@ -4,13 +4,13 @@ package main
 
 import "errors"
 
-func nativeAudioStartFile(string, EQConfig) error {
+func nativeAudioStartTrack(Track, EQConfig) error {
 	return errors.New("MiSTer Hi-Fi audio engine requires a CGO build")
 }
 func nativeAudioStartPCM(EQConfig) error {
 	return errors.New("MiSTer Hi-Fi audio engine requires a CGO build")
 }
-func nativeAudioQueueNextFile(string) error      { return nil }
+func nativeAudioQueueNextTrack(Track) error      { return nil }
 func nativeAudioMarkPCMTransition(float64) error { return nil }
 func nativeAudioTakeTransition() bool            { return false }
 func nativeAudioWritePCM([]byte) error {

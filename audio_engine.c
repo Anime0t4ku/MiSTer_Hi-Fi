@@ -9,6 +9,9 @@
 #include <time.h>
 #include <pthread.h>
 #include <limits.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
 
 #define MH_RATE 44100
 #define MH_CHANNELS 2
@@ -21,6 +24,10 @@
 typedef struct {
     float b0,b1,b2,a1,a2,z1,z2;
 } mh_biquad;
+
+typedef struct {
+    int fd;
+} mh_fd_source;
 
 typedef struct {
     ma_device device;
@@ -45,8 +52,9 @@ typedef struct {
     volatile int transitioned;
     double duration;
     double pending_duration;
-    char next_path[PATH_MAX];
-    volatile int next_path_ready;
+    mh_fd_source* decoder_source;
+    int next_fd;
+    volatile int next_fd_ready;
     pthread_mutex_t next_mutex;
     float levels[10];
     float viz_pcm[2][1024 * MH_CHANNELS];
@@ -57,9 +65,49 @@ typedef struct {
     char err[256];
 } mh_audio_state;
 
-static mh_audio_state g = { .next_mutex = PTHREAD_MUTEX_INITIALIZER };
+static mh_audio_state g = { .next_mutex = PTHREAD_MUTEX_INITIALIZER, .next_fd = -1 };
 static const float g_eq_freq[5] = {60.0f,250.0f,1000.0f,4000.0f,12000.0f};
 static const float g_viz_freq[10] = {60.0f,120.0f,250.0f,500.0f,1000.0f,2000.0f,4000.0f,8000.0f,12000.0f,16000.0f};
+
+static ma_result mh_fd_read(ma_decoder* pDecoder, void* pBufferOut, size_t bytesToRead, size_t* pBytesRead) {
+    mh_fd_source* src = (mh_fd_source*)pDecoder->pUserData;
+    if (!src || src->fd < 0) return MA_INVALID_ARGS;
+    ssize_t n;
+    do { n = read(src->fd, pBufferOut, bytesToRead); } while (n < 0 && errno == EINTR);
+    if (n < 0) return MA_ERROR;
+    if (pBytesRead) *pBytesRead = (size_t)n;
+    return MA_SUCCESS;
+}
+
+static ma_result mh_fd_seek(ma_decoder* pDecoder, ma_int64 byteOffset, ma_seek_origin origin) {
+    mh_fd_source* src = (mh_fd_source*)pDecoder->pUserData;
+    if (!src || src->fd < 0) return MA_INVALID_ARGS;
+    int whence = origin == ma_seek_origin_current ? SEEK_CUR : SEEK_SET;
+    off_t r;
+    do { r = lseek(src->fd, (off_t)byteOffset, whence); } while (r == (off_t)-1 && errno == EINTR);
+    return r == (off_t)-1 ? MA_ERROR : MA_SUCCESS;
+}
+
+static mh_fd_source* mh_fd_source_dup(int fd) {
+    int owned = dup(fd);
+    if (owned < 0) return NULL;
+    mh_fd_source* src = (mh_fd_source*)malloc(sizeof(*src));
+    if (!src) { close(owned); return NULL; }
+    src->fd = owned;
+    return src;
+}
+
+static void mh_fd_source_free(mh_fd_source* src) {
+    if (!src) return;
+    if (src->fd >= 0) close(src->fd);
+    free(src);
+}
+
+static ma_result mh_decoder_init_fd_source(mh_fd_source* src, const ma_decoder_config* dc, ma_decoder* decoder) {
+    if (!src || src->fd < 0) return MA_INVALID_ARGS;
+    if (lseek(src->fd, 0, SEEK_SET) == (off_t)-1) return MA_ERROR;
+    return ma_decoder_init(mh_fd_read, mh_fd_seek, src, dc, decoder);
+}
 
 static void mh_sleep_us(long usec) {
     struct timespec ts;
@@ -162,33 +210,41 @@ static void* mh_file_decode_worker(void* arg) {
         ma_result r = ma_decoder_read_pcm_frames(&g.decoder, pcm, want, &got);
         if (got > 0 && mh_ring_write_f32(pcm, (ma_uint32)got) != 0) break;
         if (r != MA_SUCCESS || got < want) {
-            char next[PATH_MAX];
-            next[0] = '\0';
+            int next_fd = -1;
             pthread_mutex_lock(&g.next_mutex);
-            if (g.next_path_ready) {
-                snprintf(next, sizeof(next), "%s", g.next_path);
-                g.next_path_ready = 0;
-                g.next_path[0] = '\0';
+            if (g.next_fd_ready) {
+                next_fd = g.next_fd;
+                g.next_fd = -1;
+                g.next_fd_ready = 0;
             }
             pthread_mutex_unlock(&g.next_mutex);
-            if (next[0] != '\0') {
+            if (next_fd >= 0) {
                 ma_uint64 boundary = g.frames_written;
                 ma_decoder next_decoder;
                 ma_decoder_config dc = ma_decoder_config_init(ma_format_f32, MH_CHANNELS, MH_RATE);
-                if (ma_decoder_init_file(next, &dc, &next_decoder) == MA_SUCCESS) {
-                    ma_uint64 next_frames = 0;
-                    double next_duration = 0.0;
-                    if (ma_decoder_get_length_in_pcm_frames(&next_decoder, &next_frames) == MA_SUCCESS) {
-                        next_duration = (double)next_frames / (double)MH_RATE;
+                mh_fd_source* next_source = (mh_fd_source*)malloc(sizeof(*next_source));
+                if (next_source) {
+                    next_source->fd = next_fd;
+                    if (mh_decoder_init_fd_source(next_source, &dc, &next_decoder) == MA_SUCCESS) {
+                        ma_uint64 next_frames = 0;
+                        double next_duration = 0.0;
+                        if (ma_decoder_get_length_in_pcm_frames(&next_decoder, &next_frames) == MA_SUCCESS) {
+                            next_duration = (double)next_frames / (double)MH_RATE;
+                        }
+                        ma_decoder_uninit(&g.decoder);
+                        mh_fd_source_free(g.decoder_source);
+                        g.decoder = next_decoder;
+                        g.decoder_source = next_source;
+                        g.decoder_init = 1;
+                        g.pending_duration = next_duration;
+                        g.transition_frame = boundary;
+                        g.transition_armed = 1;
+                        g.decoder_eof = 0;
+                        continue;
                     }
-                    ma_decoder_uninit(&g.decoder);
-                    g.decoder = next_decoder;
-                    g.decoder_init = 1;
-                    g.pending_duration = next_duration;
-                    g.transition_frame = boundary;
-                    g.transition_armed = 1;
-                    g.decoder_eof = 0;
-                    continue;
+                    mh_fd_source_free(next_source);
+                } else {
+                    close(next_fd);
                 }
             }
             g.decoder_eof = 1;
@@ -300,21 +356,25 @@ void mh_audio_stop(void) {
     if (g.device_init) { ma_device_uninit(&g.device); g.device_init=0; }
     mh_stop_decoder_thread();
     if (g.decoder_init) { ma_decoder_uninit(&g.decoder); g.decoder_init=0; }
+    mh_fd_source_free(g.decoder_source); g.decoder_source=NULL;
     if (g.ring_init) { ma_pcm_rb_uninit(&g.ring); g.ring_init=0; }
     g.mode=0; g.paused=0; g.ended=0; g.pcm_eof=0; g.decoder_eof=0;
     g.frames_played=0; g.frames_written=0; g.track_start_frame=0; g.transition_frame=0;
     g.transition_armed=0; g.transitioned=0; g.duration=0.0; g.pending_duration=0.0;
     pthread_mutex_lock(&g.next_mutex);
-    g.next_path_ready=0; g.next_path[0]='\0';
+    if (g.next_fd >= 0) close(g.next_fd);
+    g.next_fd=-1; g.next_fd_ready=0;
     pthread_mutex_unlock(&g.next_mutex);
     for (int i=0;i<10;++i) g.levels[i]=0;
     g.viz_frames[0]=0; g.viz_frames[1]=0; g.viz_ready=0;
 }
 
-int mh_audio_start_file(const char* path, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble) {
+int mh_audio_start_fd(int fd, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble) {
     mh_audio_stop();
+    g.decoder_source = mh_fd_source_dup(fd);
+    if (!g.decoder_source) { mh_seterr("unable to open audio file descriptor"); return -1; }
     ma_decoder_config dc=ma_decoder_config_init(ma_format_f32,MH_CHANNELS,MH_RATE);
-    if (ma_decoder_init_file(path,&dc,&g.decoder)!=MA_SUCCESS) { mh_seterr("unable to decode audio file"); return -1; }
+    if (mh_decoder_init_fd_source(g.decoder_source,&dc,&g.decoder)!=MA_SUCCESS) { mh_seterr("unable to decode audio file"); mh_fd_source_free(g.decoder_source); g.decoder_source=NULL; return -1; }
     g.decoder_init=1; g.mode=1; g.ended=0; g.decoder_eof=0; g.frames_played=0; g.frames_written=0; g.track_start_frame=0; g.transition_armed=0; g.transitioned=0;
     ma_uint64 duration_frames=0;
     if (ma_decoder_get_length_in_pcm_frames(&g.decoder,&duration_frames)==MA_SUCCESS) g.duration=(double)duration_frames/(double)MH_RATE;
@@ -361,11 +421,14 @@ int mh_audio_write_pcm(const void* data, size_t bytes) {
 }
 
 void mh_audio_finish_pcm(void) { g.pcm_eof=1; }
-int mh_audio_queue_next_file(const char* path) {
-    if (g.mode != 1 || !g.decoder_init || !path || !path[0]) return -1;
+int mh_audio_queue_next_fd(int fd) {
+    if (g.mode != 1 || !g.decoder_init || fd < 0) return -1;
+    int owned = dup(fd);
+    if (owned < 0) return -1;
     pthread_mutex_lock(&g.next_mutex);
-    snprintf(g.next_path, sizeof(g.next_path), "%s", path);
-    g.next_path_ready = 1;
+    if (g.next_fd >= 0) close(g.next_fd);
+    g.next_fd = owned;
+    g.next_fd_ready = 1;
     pthread_mutex_unlock(&g.next_mutex);
     return 0;
 }

@@ -15,14 +15,17 @@ import (
 	"unsafe"
 )
 
-func nativeAudioStartFile(path string, eq EQConfig) error {
-	cp := C.CString(path)
-	defer C.free(unsafe.Pointer(cp))
+func nativeAudioStartTrack(t Track, eq EQConfig) error {
+	f, err := openTrackFile(t)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	enabled := C.int(0)
 	if eq.Enabled {
 		enabled = 1
 	}
-	r := C.mh_audio_start_file(cp, enabled, C.float(eq.Bass), C.float(eq.LowMid), C.float(eq.Mid), C.float(eq.HighMid), C.float(eq.Treble))
+	r := C.mh_audio_start_fd(C.int(f.Fd()), enabled, C.float(eq.Bass), C.float(eq.LowMid), C.float(eq.Mid), C.float(eq.HighMid), C.float(eq.Treble))
 	if r != 0 {
 		return errors.New(C.GoString(C.mh_audio_last_error()))
 	}
@@ -40,10 +43,13 @@ func nativeAudioStartPCM(eq EQConfig) error {
 	return nil
 }
 
-func nativeAudioQueueNextFile(path string) error {
-	cp := C.CString(path)
-	defer C.free(unsafe.Pointer(cp))
-	if C.mh_audio_queue_next_file(cp) != 0 {
+func nativeAudioQueueNextTrack(t Track) error {
+	f, err := openTrackFile(t)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if C.mh_audio_queue_next_fd(C.int(f.Fd())) != 0 {
 		return errors.New("unable to queue gapless track")
 	}
 	return nil

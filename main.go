@@ -28,7 +28,7 @@ import (
 	"unsafe"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -52,6 +52,7 @@ type Config struct {
 	GaplessPlayback    bool     `json:"gapless_playback"`
 	SwapAB             bool     `json:"swap_ab"`
 	SwapXY             bool     `json:"swap_xy"`
+	CustomFont         string   `json:"custom_font"`
 }
 type EQConfig struct {
 	Enabled                            bool `json:"enabled"`
@@ -66,6 +67,9 @@ type SMBShare struct {
 }
 type Track struct {
 	Path, Title, Artist, Album    string
+	BaseName                      string
+	DirFD                         int
+	UseDirFD                      bool
 	Duration                      float64
 	MediaFormat                   string
 	BitDepth, SampleRate, BitRate int
@@ -75,6 +79,8 @@ type Queue struct {
 	Tracks          []Track
 	Index           int
 	Repeat, Shuffle bool
+	DirFD           int
+	UseDirFD        bool
 }
 
 type fbVar struct {
@@ -290,13 +296,45 @@ func (fb *framebuffer) presentRegion(x, y, w, h int) {
 		copy(fb.data[o:o+n], fb.back[o:o+n])
 	}
 }
+func customFallbackPixelHeight(s int) int {
+	if s < 1 {
+		s = 1
+	}
+	px := (7*s*175 + 50) / 100
+	if px < 1 {
+		px = 1
+	}
+	return px
+}
+
 func (fb *framebuffer) text(x, y, s int, str string, c color.RGBA) {
 	cx := x
 	for _, ch := range strings.ToUpper(str) {
-		g, ok := font[ch]
-		if !ok {
-			g = font[' ']
+		if g, ok := font[ch]; ok {
+			for gy, row := range g {
+				for gx := 0; gx < 5; gx++ {
+					if row&(1<<(4-gx)) != 0 {
+						fb.rect(cx+gx*s, y+gy*s, s, s, c)
+					}
+				}
+			}
+			cx += 6 * s
+			continue
 		}
+		fallbackPx := customFallbackPixelHeight(s)
+		if g, ok := customFontGlyph(ch, fallbackPx); ok {
+			baseline := y + 7*s - (fallbackPx-7*s)/2 + 2*s
+			for gy := 0; gy < g.h; gy++ {
+				for gx := 0; gx < g.w; gx++ {
+					if g.pixels[gy*g.w+gx] >= 96 {
+						fb.put(cx+g.xoff+gx, baseline+g.yoff+gy, c)
+					}
+				}
+			}
+			cx += g.advance
+			continue
+		}
+		g := font['?']
 		for gy, row := range g {
 			for gx := 0; gx < 5; gx++ {
 				if row&(1<<(4-gx)) != 0 {
@@ -307,7 +345,21 @@ func (fb *framebuffer) text(x, y, s int, str string, c color.RGBA) {
 		cx += 6 * s
 	}
 }
-func tw(s int, str string) int { return len([]rune(str)) * 6 * s }
+func tw(s int, str string) int {
+	w := 0
+	for _, ch := range strings.ToUpper(str) {
+		if _, ok := font[ch]; ok {
+			w += 6 * s
+			continue
+		}
+		if adv, ok := customFontAdvance(ch, customFallbackPixelHeight(s)); ok {
+			w += adv
+		} else {
+			w += 6 * s
+		}
+	}
+	return w
+}
 func loadImg(p string) image.Image {
 	f, e := os.Open(p)
 	if e != nil {
@@ -585,6 +637,98 @@ func saveConfig(c Config) {
 	b, _ := json.MarshalIndent(c, "", "  ")
 	_ = os.WriteFile(filepath.Join(baseDir, "config.json"), b, 0644)
 }
+
+const customFontsDir = baseDir + "/fonts"
+
+type customFontOption struct {
+	Name string
+	File string
+}
+
+func scanCustomFonts() []customFontOption {
+	_ = os.MkdirAll(customFontsDir, 0755)
+	es, err := os.ReadDir(customFontsDir)
+	if err != nil {
+		return nil
+	}
+	var out []customFontOption
+	for _, e := range es {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if ext != ".ttf" && ext != ".otf" {
+			continue
+		}
+		p := filepath.Join(customFontsDir, e.Name())
+		if !customFontValid(p) {
+			continue
+		}
+		name := strings.TrimSpace(strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())))
+		if name == "" {
+			name = e.Name()
+		}
+		out = append(out, customFontOption{Name: name, File: e.Name()})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
+	return out
+}
+
+func applyCustomFont(cfg *Config, fonts []customFontOption) {
+	if cfg == nil || cfg.CustomFont == "" {
+		setCustomFont("")
+		return
+	}
+	for _, f := range fonts {
+		if f.File == cfg.CustomFont {
+			if setCustomFont(filepath.Join(customFontsDir, f.File)) {
+				return
+			}
+			break
+		}
+	}
+	cfg.CustomFont = ""
+	setCustomFont("")
+}
+
+func customFontLabel(cfg *Config, fonts []customFontOption) string {
+	if cfg == nil || cfg.CustomFont == "" {
+		return "OFF"
+	}
+	for _, f := range fonts {
+		if f.File == cfg.CustomFont {
+			return strings.ToUpper(f.Name)
+		}
+	}
+	return "OFF"
+}
+
+func cycleCustomFont(cfg *Config, fonts []customFontOption, dir int) {
+	if cfg == nil || len(fonts) == 0 {
+		return
+	}
+	idx := 0
+	if cfg.CustomFont != "" {
+		for i, f := range fonts {
+			if f.File == cfg.CustomFont {
+				idx = i + 1
+				break
+			}
+		}
+	}
+	total := len(fonts) + 1
+	idx = (idx + dir + total) % total
+	if idx == 0 {
+		cfg.CustomFont = ""
+		setCustomFont("")
+		return
+	}
+	cfg.CustomFont = fonts[idx-1].File
+	if !setCustomFont(filepath.Join(customFontsDir, cfg.CustomFont)) {
+		cfg.CustomFont = ""
+		setCustomFont("")
+	}
+}
 func loadSMB() SMBConfig {
 	var c SMBConfig
 	b, e := os.ReadFile(filepath.Join(baseDir, "smb.json"))
@@ -677,7 +821,7 @@ func mountShare(s SMBShare) (string, error) {
 	_ = os.MkdirAll(mountRoot, 0755)
 	if !isMounted(mountRoot) {
 		src := "//" + s.Server + "/" + s.Share
-		auth := []string{"ro"}
+		auth := []string{"ro", "iocharset=utf8"}
 		if s.Guest {
 			auth = append(auth, "guest")
 		} else {
@@ -766,7 +910,23 @@ func audioFiles(dir string) []string {
 	return out
 }
 func basicTrack(p string) Track {
-	return Track{Path: p, Title: strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))}
+	return Track{Path: p, Title: strings.TrimSuffix(filepath.Base(p), filepath.Ext(p)), DirFD: -1}
+}
+
+func basicTrackAt(dirFD int, dir, name string) Track {
+	p := filepath.Join(dir, name)
+	return Track{Path: p, BaseName: name, DirFD: dirFD, UseDirFD: true, Title: strings.TrimSuffix(name, filepath.Ext(name))}
+}
+
+func openTrackFile(t Track) (*os.File, error) {
+	if t.UseDirFD && t.DirFD >= 0 && t.BaseName != "" {
+		fd, err := syscall.Openat(t.DirFD, t.BaseName, syscall.O_RDONLY, 0)
+		if err != nil {
+			return nil, err
+		}
+		return os.NewFile(uintptr(fd), t.BaseName), nil
+	}
+	return os.Open(t.Path)
 }
 func folderArtwork(dir string) image.Image {
 	es, e := os.ReadDir(dir)
@@ -802,6 +962,15 @@ func trackFromPath(p string) Track {
 	}
 	return t
 }
+
+func trackFromTrack(src Track) Track {
+	t := src
+	readBasicTags(&t)
+	if t.Art == nil && !t.UseDirFD {
+		t.Art = folderArtwork(filepath.Dir(t.Path))
+	}
+	return t
+}
 func readBasicTags(t *Track) {
 	ext := strings.ToLower(filepath.Ext(t.Path))
 	switch ext {
@@ -825,7 +994,7 @@ func syncSafeSize(b []byte) int {
 }
 
 func readMP3Info(t *Track) {
-	f, e := os.Open(t.Path)
+	f, e := openTrackFile(*t)
 	if e != nil {
 		return
 	}
@@ -877,7 +1046,7 @@ func readMP3Info(t *Track) {
 }
 
 func readWAVInfo(t *Track) {
-	f, e := os.Open(t.Path)
+	f, e := openTrackFile(*t)
 	if e != nil {
 		return
 	}
@@ -933,7 +1102,7 @@ func readWAVInfo(t *Track) {
 }
 
 func readID3(t *Track) {
-	f, e := os.Open(t.Path)
+	f, e := openTrackFile(*t)
 	if e != nil {
 		return
 	}
@@ -985,7 +1154,7 @@ func readID3(t *Track) {
 	}
 }
 func readFLAC(t *Track) {
-	f, e := os.Open(t.Path)
+	f, e := openTrackFile(*t)
 	if e != nil {
 		return
 	}
@@ -1013,7 +1182,7 @@ func readFLAC(t *Track) {
 			totalSamples := x & 0xfffffffff
 			if t.SampleRate > 0 && totalSamples > 0 {
 				t.Duration = float64(totalSamples) / float64(t.SampleRate)
-				if st, err := os.Stat(t.Path); err == nil && t.Duration > 0 {
+				if st, err := f.Stat(); err == nil && t.Duration > 0 {
 					t.BitRate = int((float64(st.Size()) * 8 / t.Duration / 1000) + 0.5)
 				}
 			}
@@ -1125,15 +1294,16 @@ func parseM3U(p string) []string {
 func buildQueue(path string, external bool) Queue {
 	var ps []string
 	idx := 0
-	st, _ := os.Stat(path)
-	if external && st != nil && st.IsDir() {
-		ps = audioFiles(path)
+	if external {
+		if st, err := os.Stat(path); err == nil && st.IsDir() {
+			ps = audioFiles(path)
+		} else {
+			ps = []string{path}
+		}
 	} else {
 		ext := strings.ToLower(filepath.Ext(path))
 		if ext == ".m3u" || ext == ".m3u8" {
 			ps = parseM3U(path)
-		} else if external {
-			ps = []string{path}
 		} else {
 			ps = audioFiles(filepath.Dir(path))
 			for i, p := range ps {
@@ -1146,6 +1316,48 @@ func buildQueue(path string, external bool) Queue {
 	q := Queue{Index: idx}
 	for _, p := range ps {
 		q.Tracks = append(q.Tracks, basicTrack(p))
+	}
+	return q
+}
+
+func buildQueueFromChoice(choice browseChoice) Queue {
+	if !choice.UseDirFD || choice.DirFD < 0 {
+		return buildQueue(choice.Path, false)
+	}
+	ext := strings.ToLower(filepath.Ext(choice.Name))
+	if ext == ".m3u" || ext == ".m3u8" {
+		_ = syscall.Close(choice.DirFD)
+		return buildQueue(choice.Path, false)
+	}
+	queueFD, err := syscall.Openat(choice.DirFD, ".", syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		_ = syscall.Close(choice.DirFD)
+		return Queue{}
+	}
+	df := os.NewFile(uintptr(queueFD), choice.Dir)
+	entries, err := df.ReadDir(-1)
+	_ = df.Close()
+	if err != nil {
+		_ = syscall.Close(choice.DirFD)
+		return Queue{}
+	}
+	names := make([]string, 0, len(entries))
+	for _, x := range entries {
+		if x.IsDir() {
+			continue
+		}
+		e := strings.ToLower(filepath.Ext(x.Name()))
+		if e == ".mp3" || e == ".wav" || e == ".flac" {
+			names = append(names, x.Name())
+		}
+	}
+	sort.Slice(names, func(i, j int) bool { return strings.ToLower(names[i]) < strings.ToLower(names[j]) })
+	q := Queue{DirFD: choice.DirFD, UseDirFD: true}
+	for i, name := range names {
+		if name == choice.Name {
+			q.Index = i
+		}
+		q.Tracks = append(q.Tracks, basicTrackAt(choice.DirFD, choice.Dir, name))
 	}
 	return q
 }
@@ -1306,14 +1518,14 @@ type Player struct {
 func newPlayer(q Queue, cfg Config) *Player {
 	return &Player{q: q, cfg: cfg, stopped: true, gaplessQueuedIndex: -1}
 }
-func (p *Player) loadCurrentMetadata(index int, path string) {
-	if strings.HasPrefix(path, "cdda:") {
+func (p *Player) loadCurrentMetadata(index int, src Track) {
+	if strings.HasPrefix(src.Path, "cdda:") {
 		return
 	}
 	go func() {
-		t := trackFromPath(path)
+		t := trackFromTrack(src)
 		p.mu.Lock()
-		if index >= 0 && index < len(p.q.Tracks) && p.q.Tracks[index].Path == path {
+		if index >= 0 && index < len(p.q.Tracks) && p.q.Tracks[index].Path == src.Path {
 			p.q.Tracks[index] = t
 		}
 		p.mu.Unlock()
@@ -1378,7 +1590,7 @@ func (p *Player) prepareGaplessNextFile() {
 	}
 	p.gaplessQueuedIndex = nextIndex
 	p.mu.Unlock()
-	if err := nativeAudioQueueNextFile(next.Path); err != nil {
+	if err := nativeAudioQueueNextTrack(next); err != nil {
 		p.mu.Lock()
 		if p.gaplessQueuedIndex == nextIndex {
 			p.gaplessQueuedIndex = -1
@@ -1402,7 +1614,7 @@ func (p *Player) handleGaplessTransition() {
 	p.stopped = false
 	p.mu.Unlock()
 	if !strings.HasPrefix(t.Path, "cdda:") {
-		p.loadCurrentMetadata(nextIndex, t.Path)
+		p.loadCurrentMetadata(nextIndex, t)
 		p.prepareGaplessNextFile()
 	}
 }
@@ -1428,9 +1640,9 @@ func (p *Player) playCurrent() error {
 	if strings.HasPrefix(t.Path, "cdda:") {
 		err = p.playCDTrack(t, stop)
 	} else {
-		err = nativeAudioStartFile(t.Path, cfg.EQ)
+		err = nativeAudioStartTrack(t, cfg.EQ)
 		if err == nil {
-			p.loadCurrentMetadata(idx, t.Path)
+			p.loadCurrentMetadata(idx, t)
 		}
 	}
 	if err != nil {
@@ -1628,8 +1840,10 @@ func (a *App) stopAndUnload() {
 			}
 		}
 	}
-	a.player.stopAndReset()
+	p := a.player
 	a.player = nil
+	p.stopAndReset()
+	closeQueueDirFD(&p.q)
 }
 func (p *Player) advance() {
 	p.mu.Lock()
@@ -1809,12 +2023,33 @@ func drawClock(fb *framebuffer, cfg *Config, bg color.RGBA) (int, int, int, int)
 	return x, y, w, h
 }
 
+func closeQueueDirFD(q *Queue) {
+	if q == nil || !q.UseDirFD || q.DirFD < 0 {
+		return
+	}
+	fd := q.DirFD
+	q.DirFD = -1
+	q.UseDirFD = false
+	for i := range q.Tracks {
+		if q.Tracks[i].UseDirFD && q.Tracks[i].DirFD == fd {
+			q.Tracks[i].DirFD = -1
+			q.Tracks[i].UseDirFD = false
+		}
+	}
+	_ = syscall.Close(fd)
+}
+
 func (a *App) startQueue(q Queue, origin *browseOrigin) error {
 	if a.player != nil {
-		a.player.stopPlaybackRaw()
+		old := a.player
+		a.player = nil
+		a.origin = nil
+		old.stopPlaybackRaw()
+		closeQueueDirFD(&old.q)
 	}
 	p := newPlayer(q, *a.cfg)
 	if err := p.playCurrent(); err != nil {
+		closeQueueDirFD(&q)
 		return err
 	}
 	a.player = p
@@ -2193,38 +2428,102 @@ func settleInput(acts <-chan action, d time.Duration) {
 
 type browseChoice struct {
 	Path, Dir, Name string
+	DirFD           int
+	UseDirFD        bool
+}
+
+type browseEntry struct {
+	Name  string
+	Path  string
+	IsDir bool
+}
+
+func openDirChild(parent *os.File, name string) (*os.File, error) {
+	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+func openDirChain(root, target string) ([]*os.File, []string, error) {
+	rootFile, err := os.Open(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	files := []*os.File{rootFile}
+	paths := []string{root}
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return files, paths, nil
+	}
+	curPath := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		child, e := openDirChild(files[len(files)-1], part)
+		if e != nil {
+			for _, f := range files {
+				_ = f.Close()
+			}
+			rootFile, e2 := os.Open(root)
+			if e2 != nil {
+				return nil, nil, e
+			}
+			return []*os.File{rootFile}, []string{root}, nil
+		}
+		files = append(files, child)
+		curPath = filepath.Join(curPath, part)
+		paths = append(paths, curPath)
+	}
+	return files, paths, nil
 }
 
 func browse(app *App, root, startDir, initialName string) (browseChoice, bool) {
 	settleInput(app.acts, 180*time.Millisecond)
-	dir := startDir
-	if dir == "" {
-		dir = root
+	if startDir == "" {
+		startDir = root
 	}
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		dir = root
+	stack, pathStack, err := openDirChain(root, startDir)
+	if err != nil {
+		return browseChoice{}, false
 	}
+	defer func() {
+		for _, f := range stack {
+			_ = f.Close()
+		}
+	}()
 	focusName := initialName
 	for {
-		es, e := os.ReadDir(dir)
+		cur := stack[len(stack)-1]
+		dir := pathStack[len(pathStack)-1]
+		_, _ = cur.Seek(0, io.SeekStart)
+		es, e := cur.ReadDir(-1)
 		if e != nil {
 			return browseChoice{}, false
 		}
-		var names []string
+		entries := make([]browseEntry, 0, len(es))
 		for _, x := range es {
-			if strings.HasPrefix(x.Name(), ".") {
+			name := x.Name()
+			if strings.HasPrefix(name, ".") {
 				continue
 			}
-			if x.IsDir() || supported[strings.ToLower(filepath.Ext(x.Name()))] {
-				names = append(names, x.Name())
+			isDir := x.IsDir()
+			if isDir || supported[strings.ToLower(filepath.Ext(name))] {
+				entries = append(entries, browseEntry{Name: name, Path: filepath.Join(dir, name), IsDir: isDir})
 			}
 		}
-		sort.Slice(names, func(i, j int) bool { return strings.ToLower(names[i]) < strings.ToLower(names[j]) })
-		items := append([]string{"[..]"}, names...)
+		sort.Slice(entries, func(i, j int) bool { return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name) })
+		items := make([]string, 1, len(entries)+1)
+		items[0] = "[..]"
+		for _, entry := range entries {
+			items = append(items, entry.Name)
+		}
 		initial := 0
 		if focusName != "" {
-			for i, name := range names {
-				if name == focusName {
+			for i, entry := range entries {
+				if entry.Name == focusName {
 					initial = i + 1
 					break
 				}
@@ -2233,31 +2532,42 @@ func browse(app *App, root, startDir, initialName string) (browseChoice, bool) {
 		focusName = ""
 		i, ok := menu(app, "BROWSE: "+short(dir, 32), items, initial)
 		if !ok {
-			if app.jumpSources {
-				return browseChoice{}, false
-			}
-			if filepath.Clean(dir) == filepath.Clean(root) {
+			if app.jumpSources || len(stack) == 1 {
 				return browseChoice{}, false
 			}
 			focusName = filepath.Base(dir)
-			dir = filepath.Dir(dir)
+			_ = stack[len(stack)-1].Close()
+			stack = stack[:len(stack)-1]
+			pathStack = pathStack[:len(pathStack)-1]
 			continue
 		}
 		if i == 0 {
-			if filepath.Clean(dir) == filepath.Clean(root) {
+			if len(stack) == 1 {
 				return browseChoice{}, false
 			}
 			focusName = filepath.Base(dir)
-			dir = filepath.Dir(dir)
+			_ = stack[len(stack)-1].Close()
+			stack = stack[:len(stack)-1]
+			pathStack = pathStack[:len(pathStack)-1]
 			continue
 		}
-		p := filepath.Join(dir, names[i-1])
-		st, _ := os.Stat(p)
-		if st != nil && st.IsDir() {
-			dir = p
+		entry := entries[i-1]
+		if entry.IsDir {
+			child, e := openDirChild(cur, entry.Name)
+			if e != nil {
+				message(app, "BROWSE ERROR", e.Error())
+				continue
+			}
+			stack = append(stack, child)
+			pathStack = append(pathStack, entry.Path)
 			continue
 		}
-		return browseChoice{Path: p, Dir: dir, Name: names[i-1]}, true
+		dupFD, e := syscall.Dup(int(cur.Fd()))
+		if e != nil {
+			message(app, "BROWSE ERROR", e.Error())
+			continue
+		}
+		return browseChoice{Path: entry.Path, Dir: dir, Name: entry.Name, DirFD: dupFD, UseDirFD: true}, true
 	}
 }
 
@@ -3114,7 +3424,7 @@ func runBrowserSource(app *App, root, kind string) {
 			return
 		}
 		origin := &browseOrigin{Root: root, Dir: choice.Dir, Selected: choice.Name, Kind: kind}
-		if err := app.startQueue(buildQueue(choice.Path, false), origin); err != nil {
+		if err := app.startQueue(buildQueueFromChoice(choice), origin); err != nil {
 			message(app, "PLAYBACK ERROR", err.Error())
 			startDir, selected = choice.Dir, choice.Name
 			continue
@@ -3211,9 +3521,22 @@ func settingsUI(app *App) {
 		"GAPLESS PLAYBACK (EXPERIMENTAL)",
 		"SWAP A/B",
 		"SWAP X/Y",
+		"CUSTOM FALLBACK FONT",
+	}
+	fonts := scanCustomFonts()
+	applyCustomFont(cfg, fonts)
+	fallbackFontHelp := "USED ONLY FOR CHARACTERS MISSING FROM THE BUILT-IN FONT"
+	if len(fonts) == 0 {
+		fallbackFontHelp = "ADD .TTF OR .OTF FONTS TO THE MISTER HI-FI FONTS FOLDER"
 	}
 	enabled := func(i int) bool {
-		return i != 2 || !cfg.HideAlbumArt
+		if i == 2 && cfg.HideAlbumArt {
+			return false
+		}
+		if i == 9 && len(fonts) == 0 {
+			return false
+		}
+		return true
 	}
 	move := func(from, dir int) int {
 		i := from
@@ -3249,6 +3572,7 @@ func settingsUI(app *App) {
 			onoff(cfg.GaplessPlayback),
 			onoff(cfg.SwapAB),
 			onoff(cfg.SwapXY),
+			customFontLabel(cfg, fonts),
 		}
 		ts := max(1, row/22)
 		for i := range labels {
@@ -3266,7 +3590,7 @@ func settingsUI(app *App) {
 				valueColor = color.RGBA{75, 75, 82, 255}
 				subColor = color.RGBA{70, 70, 76, 255}
 			}
-			hasSub := i == 5 || i == 6
+			hasSub := i == 5 || i == 6 || i == 9
 			labelY := y + 5
 			if hasSub {
 				labelY = y + 1
@@ -3279,6 +3603,10 @@ func settingsUI(app *App) {
 			if i == 6 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, "FLAC / WAV / CDDA ONLY", subColor)
+			}
+			if i == 9 {
+				subScale := max(1, ts-1)
+				fb.text(65, labelY+ts*8, subScale, fallbackFontHelp, subColor)
 			}
 			fb.text(fb.w-65-tw(ts, values[i]), y+5, ts, values[i], valueColor)
 		}
@@ -3355,6 +3683,12 @@ func settingsUI(app *App) {
 			case 8:
 				cfg.SwapXY = !cfg.SwapXY
 				swapXYInput.Store(cfg.SwapXY)
+			case 9:
+				dir := 1
+				if a == actLeft {
+					dir = -1
+				}
+				cycleCustomFont(cfg, fonts, dir)
 			}
 			saveConfig(*cfg)
 		}
@@ -3553,6 +3887,10 @@ func main() {
 	term := quietTerm()
 	defer term.restore()
 	cfg := loadConfig()
+	_ = os.MkdirAll(customFontsDir, 0755)
+	startupFonts := scanCustomFonts()
+	applyCustomFont(&cfg, startupFonts)
+	saveConfig(cfg)
 	swapABInput.Store(cfg.SwapAB)
 	swapXYInput.Store(cfg.SwapXY)
 	done := make(chan struct{})
