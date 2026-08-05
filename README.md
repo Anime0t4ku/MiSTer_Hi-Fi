@@ -6,7 +6,7 @@
 
 MiSTer Hi-Fi is a controller-first music player for MiSTer FPGA.
 
-It supports local music, USB storage, SMB shares, playlists, physical Audio CDs, album artwork, a visualizer, equalizer, OLED mode, and direct launching through NFC using Zaparoo.
+It supports local music, USB storage, SMB shares, online radio, playlists, physical Audio CDs, album artwork, a visualizer, equalizer, OLED mode, and direct launching through NFC using Zaparoo.
 
 ## Installation
 
@@ -39,6 +39,7 @@ MiSTer Hi-Fi supports:
 SD Card
 USB
 SMB
+Online Radio
 Physical Disc
 ```
 
@@ -54,6 +55,7 @@ Current audio support:
 MP3
 FLAC
 WAV
+Ogg Vorbis
 M4A (AAC / ALAC)
 M3U
 M3U8
@@ -65,6 +67,30 @@ When selecting a normal audio file from the built-in browser, MiSTer Hi-Fi treat
 Subfolders are not scanned recursively.
 
 M3U and M3U8 playlists use the tracks and order defined by the playlist.
+
+## Online Radio
+
+Online Radio stations are configured in:
+
+```text
+/media/fat/Scripts/.config/MiSTerHiFi/radio.json
+```
+
+Each station requires a name and direct HTTP or HTTPS audio stream URL. The optional `genre` field is displayed in the station list. See `radio.example.json` for the configuration format.
+
+Current Online Radio codec support:
+
+```text
+MP3
+FLAC
+Ogg/FLAC
+Ogg Vorbis
+WAV / PCM
+```
+
+Only the codecs listed above are currently supported for Online Radio. Any other radio codec or container is currently unsupported and will be rejected before playback starts. This includes raw AAC, AAC+ / HE-AAC and Opus / Ogg Opus.
+
+M4A files containing AAC or ALAC remain supported for normal file playback through MiSTer Hi-Fi's separate M4A decoder; this does not add support for raw AAC or AAC+ internet radio streams.
 
 ## Album Artwork
 
@@ -115,6 +141,32 @@ Example:
 Multiple shares can be configured.
 
 SMB playback uses background read-ahead buffering so short network or storage delays do not interrupt playback while still keeping startup fast.
+
+## Online Radio
+
+Online Radio stations are configured in:
+
+```text
+/media/fat/Scripts/.config/MiSTerHiFi/radio.json
+```
+
+A `radio.example.json` file is included as a schema example. Copy or rename it to `radio.json` and replace the placeholder station names and URLs with direct HTTP or HTTPS audio stream URLs. The example intentionally does not contain a working radio stream.
+
+Example:
+
+```json
+{
+  "stations": [
+    {
+      "name": "Example Radio Station",
+      "url": "https://example.com/live.flac",
+      "genre": "Example Genre"
+    }
+  ]
+}
+```
+
+`name` and `url` are required. `genre` is optional. Online Radio is intended for direct audio stream URLs rather than station web pages or playlist landing pages.
 
 SMB shares are mounted temporarily under:
 

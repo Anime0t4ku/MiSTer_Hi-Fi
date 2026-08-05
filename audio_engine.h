@@ -2,6 +2,7 @@
 #define MISTER_HIFI_AUDIO_ENGINE_H
 #include <stddef.h>
 int mh_audio_start_fd(int fd, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble);
+int mh_audio_start_stream_fd(int fd, int encoding, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble);
 int mh_audio_start_m4a_fd(int fd, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble);
 int mh_audio_start_pcm(int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble);
 int mh_audio_queue_next_fd(int fd);

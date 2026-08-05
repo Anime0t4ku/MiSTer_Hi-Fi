@@ -4,38 +4,40 @@ set -eu
 cd "$(dirname "$0")"
 
 VERSION="0.11.25"
-URL="https://raw.githubusercontent.com/mackron/miniaudio/${VERSION}/miniaudio.h"
-OUT="miniaudio.h"
-TMP="${OUT}.tmp"
+BASE_URL="https://raw.githubusercontent.com/mackron/miniaudio/${VERSION}"
 
-if [ -s "$OUT" ]; then
-    echo "miniaudio ${VERSION} already present: $OUT"
-    exit 0
-fi
+fetch_file() {
+    url="$1"
+    out="$2"
+    check="$3"
+    tmp="${out}.tmp"
 
-rm -f "$OUT" "$TMP"
-echo "Fetching miniaudio ${VERSION}..."
+    if [ -s "$out" ] && grep -q "$check" "$out"; then
+        echo "Already present: $out"
+        return
+    fi
 
-if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 --connect-timeout 15 "$URL" -o "$TMP"
-elif command -v wget >/dev/null 2>&1; then
-    wget -O "$TMP" "$URL"
-else
-    echo "Error: curl or wget is required to fetch miniaudio.h" >&2
-    exit 1
-fi
+    rm -f "$out" "$tmp"
+    echo "Fetching $out..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --retry 3 --connect-timeout 15 "$url" -o "$tmp"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$tmp" "$url"
+    else
+        echo "Error: curl or wget is required" >&2
+        exit 1
+    fi
 
-if [ ! -s "$TMP" ]; then
-    echo "Error: downloaded miniaudio.h is empty" >&2
-    rm -f "$TMP"
-    exit 1
-fi
+    if [ ! -s "$tmp" ] || ! grep -q "$check" "$tmp"; then
+        echo "Error: downloaded $out is invalid" >&2
+        rm -f "$tmp"
+        exit 1
+    fi
+    mv "$tmp" "$out"
+}
 
-if ! grep -q "#define miniaudio_h" "$TMP"; then
-    echo "Error: downloaded file does not look like miniaudio.h" >&2
-    rm -f "$TMP"
-    exit 1
-fi
+fetch_file "$BASE_URL/miniaudio.h" "miniaudio.h" "#define miniaudio_h"
+rm -f stb_vorbis.c
+fetch_file "$BASE_URL/extras/stb_vorbis.c" "stb_vorbis.h" "STB_VORBIS_INCLUDE_STB_VORBIS_H"
 
-mv "$TMP" "$OUT"
-echo "Saved miniaudio ${VERSION} to $OUT"
+echo "miniaudio ${VERSION} + stb_vorbis ready"

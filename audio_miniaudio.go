@@ -12,7 +12,14 @@ package main
 import "C"
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"unsafe"
@@ -38,6 +45,162 @@ func nativeAudioStartTrack(t Track, eq EQConfig) error {
 		return errors.New(C.GoString(C.mh_audio_last_error()))
 	}
 	return nil
+}
+
+func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "MiSTer-Hi-Fi/"+version)
+	req.Header.Set("Icy-MetaData", "0")
+	req.Header.Set("Accept", "audio/*,*/*;q=0.8")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("radio stream returned %s", resp.Status)
+	}
+	br := bufio.NewReaderSize(resp.Body, 16384)
+	probe, _ := br.Peek(8192)
+	encoding := radioEncodingHint(probe, resp.Header.Get("Content-Type"), rawURL)
+	if encoding < 0 {
+		resp.Body.Close()
+		cancel()
+		return nil, errors.New("unsupported radio codec")
+	}
+	if encoding == 0 {
+		resp.Body.Close()
+		cancel()
+		return nil, errors.New("unable to identify radio codec")
+	}
+	if encoding == 2 {
+		if off := firstMP3FrameOffset(probe); off > 0 {
+			_, _ = br.Discard(off)
+		}
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		resp.Body.Close()
+		cancel()
+		return nil, err
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer w.Close()
+		defer resp.Body.Close()
+		_, _ = io.Copy(w, br)
+	}()
+
+	enabled := C.int(0)
+	if eq.Enabled {
+		enabled = 1
+	}
+	rc := C.mh_audio_start_stream_fd(C.int(r.Fd()), C.int(encoding), enabled, C.float(eq.Bass), C.float(eq.LowMid), C.float(eq.Mid), C.float(eq.HighMid), C.float(eq.Treble))
+	_ = r.Close()
+	if rc != 0 {
+		cancel()
+		_ = w.Close()
+		<-done
+		return nil, errors.New(C.GoString(C.mh_audio_last_error()))
+	}
+	stop := func() {
+		cancel()
+		_ = w.Close()
+	}
+	return stop, nil
+}
+
+func firstMP3FrameOffset(b []byte) int {
+	for i := 0; i+4 <= len(b); i++ {
+		if b[i] != 0xff || (b[i+1]&0xe0) != 0xe0 {
+			continue
+		}
+		version := (b[i+1] >> 3) & 0x03
+		layer := (b[i+1] >> 1) & 0x03
+		bitrate := (b[i+2] >> 4) & 0x0f
+		sampleRate := (b[i+2] >> 2) & 0x03
+		if version == 1 || layer == 0 || bitrate == 0 || bitrate == 0x0f || sampleRate == 3 {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+func looksLikeADTS(b []byte) bool {
+	if len(b) < 2 {
+		return false
+	}
+	return b[0] == 0xff && (b[1]&0xf6) == 0xf0
+}
+
+func looksLikeMP3Frame(b []byte) bool {
+	if len(b) < 4 || b[0] != 0xff || (b[1]&0xe0) != 0xe0 {
+		return false
+	}
+	version := (b[1] >> 3) & 0x03
+	layer := (b[1] >> 1) & 0x03
+	bitrate := (b[2] >> 4) & 0x0f
+	sampleRate := (b[2] >> 2) & 0x03
+	return version != 1 && layer != 0 && bitrate != 0 && bitrate != 0x0f && sampleRate != 3
+}
+
+func radioEncodingHint(probe []byte, contentType, rawURL string) int {
+	lowerProbe := bytes.ToLower(probe)
+	ct := strings.ToLower(contentType)
+	u := strings.ToLower(rawURL)
+
+	if strings.Contains(ct, "aac") || strings.Contains(ct, "aacp") || looksLikeADTS(probe) {
+		return -1
+	}
+	if bytes.HasPrefix(probe, []byte("OggS")) {
+		if bytes.Contains(probe, []byte("OpusHead")) {
+			return -1
+		}
+		if bytes.Contains(probe, []byte("fLaC")) || bytes.Contains(probe, []byte("FLAC")) {
+			return 5
+		}
+		if bytes.Contains(lowerProbe, []byte("vorbis")) {
+			return 3
+		}
+	}
+	if bytes.HasPrefix(probe, []byte("fLaC")) || bytes.Contains(probe, []byte("fLaC")) {
+		return 1
+	}
+	if bytes.HasPrefix(probe, []byte("RIFF")) && len(probe) >= 12 && string(probe[8:12]) == "WAVE" {
+		return 4
+	}
+	if bytes.HasPrefix(probe, []byte("ID3")) || looksLikeMP3Frame(probe) {
+		return 2
+	}
+	if bytes.Contains(lowerProbe, []byte("vorbis")) {
+		return 3
+	}
+	if strings.Contains(ct, "flac") || strings.Contains(u, ".flac") || strings.HasSuffix(u, "/flac") {
+		return 1
+	}
+	if strings.Contains(ct, "mpeg") || strings.Contains(ct, "mp3") || strings.Contains(u, ".mp3") {
+		return 2
+	}
+	if strings.Contains(ct, "opus") {
+		return -1
+	}
+	if strings.Contains(ct, "vorbis") || strings.Contains(u, ".ogg") || strings.Contains(u, ".oga") {
+		return 3
+	}
+	if strings.Contains(ct, "wav") || strings.Contains(u, ".wav") {
+		return 4
+	}
+	return 0
 }
 
 func nativeAudioStartPCM(eq EQConfig) error {

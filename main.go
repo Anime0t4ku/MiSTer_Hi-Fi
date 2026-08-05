@@ -30,12 +30,12 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.2.0"
+const version = "1.3.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
 
-var supported = map[string]bool{".mp3": true, ".wav": true, ".flac": true, ".m4a": true, ".m3u": true, ".m3u8": true}
+var supported = map[string]bool{".mp3": true, ".wav": true, ".flac": true, ".ogg": true, ".oga": true, ".m4a": true, ".m3u": true, ".m3u8": true}
 
 var swapABInput atomic.Bool
 var swapXYInput atomic.Bool
@@ -66,6 +66,12 @@ type SMBConfig struct {
 type SMBShare struct {
 	Name, Server, Share, Path, Username, Password string
 	Guest                                         bool
+}
+type RadioConfig struct {
+	Stations []RadioStation `json:"stations"`
+}
+type RadioStation struct {
+	Name, URL, Genre string
 }
 type Track struct {
 	Path, Title, Artist, Album    string
@@ -740,6 +746,37 @@ func loadSMB() SMBConfig {
 	return c
 }
 func smbAvailable() bool { c := loadSMB(); return len(c.Shares) > 0 }
+
+func loadRadio() (RadioConfig, error) {
+	var c RadioConfig
+	b, err := os.ReadFile(filepath.Join(baseDir, "radio.json"))
+	if err != nil {
+		return c, err
+	}
+	if err := json.Unmarshal(b, &c); err != nil {
+		return c, err
+	}
+	out := c.Stations[:0]
+	for _, station := range c.Stations {
+		station.Name = strings.TrimSpace(station.Name)
+		station.URL = strings.TrimSpace(station.URL)
+		station.Genre = strings.TrimSpace(station.Genre)
+		if station.Name == "" || !isHTTPURL(station.URL) {
+			continue
+		}
+		out = append(out, station)
+	}
+	c.Stations = out
+	return c, nil
+}
+
+func isHTTPURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
 func sanitize(s string) string {
 	r := strings.NewReplacer("/", "_", "\\", "_", " ", "_")
 	return r.Replace(s)
@@ -902,7 +939,7 @@ func audioFiles(dir string) []string {
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(x.Name()))
-		if ext == ".mp3" || ext == ".wav" || ext == ".flac" || ext == ".m4a" {
+		if ext == ".mp3" || ext == ".wav" || ext == ".flac" || (ext == ".ogg" || ext == ".oga") || ext == ".m4a" {
 			out = append(out, filepath.Join(dir, x.Name()))
 		}
 	}
@@ -1032,6 +1069,8 @@ func readBasicTags(t *Track) {
 		readFLACWithRetry(t)
 	case ".wav":
 		t.MediaFormat = "WAV"
+	case ".ogg", ".oga":
+		t.MediaFormat = "OGG VORBIS"
 		readWAVInfo(t)
 	case ".m4a":
 		t.MediaFormat = "M4A"
@@ -1686,7 +1725,7 @@ func buildQueueFromChoice(choice browseChoice) Queue {
 			continue
 		}
 		e := strings.ToLower(filepath.Ext(x.Name()))
-		if e == ".mp3" || e == ".wav" || e == ".flac" || e == ".m4a" {
+		if e == ".mp3" || e == ".wav" || e == ".flac" || (e == ".ogg" || e == ".oga") || e == ".m4a" {
 			names = append(names, x.Name())
 		}
 	}
@@ -1852,6 +1891,7 @@ type Player struct {
 	basePosition       float64
 	cfg                Config
 	gaplessQueuedIndex int
+	streamCancel       func()
 }
 
 func newPlayer(q Queue, cfg Config) *Player {
@@ -1898,7 +1938,7 @@ func (p *Player) commitTrackMetadata(index int, path string, meta Track) {
 }
 
 func (p *Player) loadCurrentMetadata(index int, src Track) {
-	if strings.HasPrefix(src.Path, "cdda:") {
+	if strings.HasPrefix(src.Path, "cdda:") || isHTTPURL(src.Path) {
 		return
 	}
 
@@ -1971,6 +2011,9 @@ func (p *Player) current() *Track {
 	return &t
 }
 func gaplessTrackSupported(t Track) bool {
+	if isHTTPURL(t.Path) {
+		return false
+	}
 	if strings.HasPrefix(t.Path, "cdda:") {
 		return true
 	}
@@ -2069,6 +2112,18 @@ func (p *Player) playCurrent() error {
 	var err error
 	if strings.HasPrefix(t.Path, "cdda:") {
 		err = p.playCDTrack(t, stop)
+	} else if isHTTPURL(t.Path) {
+		var cancel func()
+		cancel, err = nativeAudioStartURL(t.Path, cfg.EQ)
+		if err == nil {
+			p.mu.Lock()
+			if p.stop == stop {
+				p.streamCancel = cancel
+			} else if cancel != nil {
+				cancel()
+			}
+			p.mu.Unlock()
+		}
 	} else {
 		err = nativeAudioStartTrack(t, cfg.EQ)
 		if err == nil {
@@ -2084,7 +2139,7 @@ func (p *Player) playCurrent() error {
 		p.mu.Unlock()
 		return err
 	}
-	if !strings.HasPrefix(t.Path, "cdda:") {
+	if !strings.HasPrefix(t.Path, "cdda:") && !isHTTPURL(t.Path) {
 		p.prepareGaplessNextFile()
 	}
 	go p.monitorPlayback(stop)
@@ -2236,6 +2291,8 @@ func (p *Player) playCDTrack(t Track, stop <-chan struct{}) error {
 
 func (p *Player) stopPlaybackRaw() {
 	p.mu.Lock()
+	cancel := p.streamCancel
+	p.streamCancel = nil
 	if p.stop != nil {
 		select {
 		case <-p.stop:
@@ -2245,6 +2302,9 @@ func (p *Player) stopPlaybackRaw() {
 	}
 	p.stop = nil
 	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	nativeAudioStop()
 }
 func (p *Player) stopAndReset() {
@@ -2357,6 +2417,9 @@ func (p *Player) seekBy(seconds float64) {
 	}
 	if t.Duration > 0 && target > t.Duration {
 		target = t.Duration
+	}
+	if isHTTPURL(t.Path) {
+		return
 	}
 	if !strings.HasPrefix(t.Path, "cdda:") {
 		_ = nativeAudioSeek(target)
@@ -4188,6 +4251,50 @@ func physicalDisc(app *App) {
 	}
 }
 
+func onlineRadioUI(app *App) {
+	initial := 0
+	for {
+		cfg, err := loadRadio()
+		if err != nil {
+			if os.IsNotExist(err) {
+				message(app, "ONLINE RADIO", "RADIO.JSON NOT FOUND")
+			} else {
+				message(app, "ONLINE RADIO", strings.ToUpper(err.Error()))
+			}
+			return
+		}
+		if len(cfg.Stations) == 0 {
+			message(app, "ONLINE RADIO", "NO VALID STATIONS IN RADIO.JSON")
+			return
+		}
+		names := make([]string, len(cfg.Stations))
+		for i, station := range cfg.Stations {
+			names[i] = station.Name
+			if station.Genre != "" {
+				names[i] += "  -  " + station.Genre
+			}
+		}
+		i, ok := menu(app, "ONLINE RADIO", names, initial)
+		if !ok {
+			return
+		}
+		station := cfg.Stations[i]
+		t := Track{Path: station.URL, Title: station.Name, Album: "Online Radio", MediaFormat: "STREAM", DirFD: -1}
+		q := Queue{Tracks: []Track{t}, Index: 0}
+		origin := &browseOrigin{Kind: "radio", Selected: station.Name}
+		if err := app.startQueue(q, origin); err != nil {
+			message(app, "RADIO ERROR", err.Error())
+			initial = i
+			continue
+		}
+		playerUI(app)
+		if app.jumpSources {
+			return
+		}
+		initial = i
+	}
+}
+
 func sourcesUI(app *App) {
 	for {
 		if app.jumpSources {
@@ -4204,6 +4311,8 @@ func sourcesUI(app *App) {
 			items = append(items, "SMB")
 			types = append(types, "smb")
 		}
+		items = append(items, "ONLINE RADIO")
+		types = append(types, "radio")
 		if len(detectOptical()) > 0 {
 			items = append(items, "PHYSICAL DISC")
 			types = append(types, "disc")
@@ -4265,6 +4374,8 @@ func sourcesUI(app *App) {
 				continue
 			}
 			runBrowserSource(app, root, "smb")
+		case "radio":
+			onlineRadioUI(app)
 		case "disc":
 			physicalDisc(app)
 		case "settings":

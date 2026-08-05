@@ -1,0 +1,13 @@
+{
+  "stations": [
+    {
+      "name": "Example Radio Station",
+      "url": "https://example.com/live.flac",
+      "genre": "Example Genre"
+    },
+    {
+      "name": "Another Station",
+      "url": "https://example.com/stream.mp3"
+    }
+  ]
+}
