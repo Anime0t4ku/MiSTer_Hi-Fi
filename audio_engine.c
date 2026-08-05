@@ -532,7 +532,7 @@ static void* mh_file_decode_worker(void* arg) {
                 ma_uint64 boundary = g.frames_written;
                 ma_decoder next_decoder;
                 ma_decoder_config dc = ma_decoder_config_init(ma_format_f32, MH_CHANNELS, MH_RATE);
-                mh_fd_source* next_source = (mh_fd_source*)malloc(sizeof(*next_source));
+                mh_fd_source* next_source = (mh_fd_source*)calloc(1, sizeof(*next_source));
                 if (next_source) {
                     next_source->fd = next_fd;
                     if (mh_decoder_init_fd_source(next_source, &dc, &next_decoder) == MA_SUCCESS) {
