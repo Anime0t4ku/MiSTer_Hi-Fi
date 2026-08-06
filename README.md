@@ -1,18 +1,14 @@
 # MiSTer Hi-Fi
 
-**Developer:** Anime0t4ku  
-**Contributor:** Phoenix
-
-
 MiSTer Hi-Fi is a controller-first music player for MiSTer FPGA.
 
-It supports local music, USB storage, SMB shares, online radio, playlists, physical Audio CDs, album artwork, a visualizer, equalizer, OLED mode, and direct launching through NFC using Zaparoo.
+It supports local music, USB storage, SMB shares, online radio, playlists, physical Audio CDs, album artwork, a spectrum visualizer, equalizer, OLED mode, custom fallback fonts, and direct launching through NFC using Zaparoo.
 
 ## Installation
 
 Download the latest release and extract it to the **root of your MiSTer SD card**.
 
-The files will be installed under:
+The files are installed under:
 
 ```text
 /media/fat/Scripts/
@@ -20,12 +16,13 @@ The files will be installed under:
 └── .config/
     └── MiSTerHiFi/
         ├── mister_hifi
-        └── smb.example.json
+        ├── smb.example.json
+        └── radio.example.json
 ```
 
 MiSTer Hi-Fi creates its configuration automatically on first launch.
 
-The configuration file is stored at:
+The main configuration file is stored at:
 
 ```text
 /media/fat/Scripts/.config/MiSTerHiFi/config.json
@@ -33,64 +30,48 @@ The configuration file is stored at:
 
 ## Sources
 
-MiSTer Hi-Fi supports:
+MiSTer Hi-Fi can browse and play music from:
 
 ```text
 SD Card
 USB
 SMB
 Online Radio
-Physical Disc
+Physical Audio CD
 ```
 
 Music can be browsed directly from the source list.
 
 Physical Audio CDs open directly in the player and automatically start from the first audio track. Press **B** from the player to open the disc track list.
 
-## Supported Audio
+## Supported Audio Formats
 
-Current audio support:
+MiSTer Hi-Fi supports the following local audio formats:
 
 ```text
 MP3
 FLAC
-WAV
+WAV / PCM
 Ogg Vorbis
-M4A (AAC / ALAC)
-M3U
-M3U8
-Audio CD
+M4A / MP4 (AAC-LC)
+M4A / MP4 (ALAC)
 ```
 
-When selecting a normal audio file from the built-in browser, MiSTer Hi-Fi treats the supported audio files in the same folder as an album queue.
+It also supports:
+
+```text
+M3U playlists
+M3U8 playlists
+Physical Audio CD / CDDA
+```
+
+M4A files can contain either **AAC-LC** or **Apple Lossless (ALAC)** audio. Embedded MP4 metadata and cover artwork are supported.
+
+When selecting a normal audio file from the built-in browser, MiSTer Hi-Fi treats all supported audio files in the same folder as an album queue.
 
 Subfolders are not scanned recursively.
 
 M3U and M3U8 playlists use the tracks and order defined by the playlist.
-
-## Online Radio
-
-Online Radio stations are configured in:
-
-```text
-/media/fat/Scripts/.config/MiSTerHiFi/radio.json
-```
-
-Each station requires a name and direct HTTP or HTTPS audio stream URL. The optional `genre` field is displayed in the station list. See `radio.example.json` for the configuration format.
-
-Current Online Radio codec support:
-
-```text
-MP3
-FLAC
-Ogg/FLAC
-Ogg Vorbis
-WAV / PCM
-```
-
-Only the codecs listed above are currently supported for Online Radio. Any other radio codec or container is currently unsupported and will be rejected before playback starts. This includes raw AAC, AAC+ / HE-AAC and Opus / Ogg Opus.
-
-M4A files containing AAC or ALAC remain supported for normal file playback through MiSTer Hi-Fi's separate M4A decoder; this does not add support for raw AAC or AAC+ internet radio streams.
 
 ## Album Artwork
 
@@ -110,9 +91,9 @@ front.jpeg
 front.png
 ```
 
-Artwork filenames are matched case-insensitively, so names such as `COVER.JPG`, `Folder.PNG` and `Front.Jpeg` also work.
+Artwork filenames are matched case-insensitively, so names such as `COVER.JPG`, `Folder.PNG`, and `Front.Jpeg` also work.
 
-If no artwork is found, MiSTer Hi-Fi uses the normal no-art player layout.
+If no artwork is found, MiSTer Hi-Fi automatically uses the normal no-art player layout.
 
 ## SMB
 
@@ -120,6 +101,12 @@ SMB shares are configured in:
 
 ```text
 /media/fat/Scripts/.config/MiSTerHiFi/smb.json
+```
+
+An example configuration is included as:
+
+```text
+/media/fat/Scripts/.config/MiSTerHiFi/smb.example.json
 ```
 
 Example:
@@ -142,6 +129,14 @@ Multiple shares can be configured.
 
 SMB playback uses background read-ahead buffering so short network or storage delays do not interrupt playback while still keeping startup fast.
 
+SMB shares are mounted temporarily under:
+
+```text
+/tmp/misterhifi-mnt/
+```
+
+No network shares are mounted inside the MiSTer Hi-Fi configuration folder.
+
 ## Online Radio
 
 Online Radio stations are configured in:
@@ -150,7 +145,15 @@ Online Radio stations are configured in:
 /media/fat/Scripts/.config/MiSTerHiFi/radio.json
 ```
 
-A `radio.example.json` file is included as a schema example. Copy or rename it to `radio.json` and replace the placeholder station names and URLs with direct HTTP or HTTPS audio stream URLs. The example intentionally does not contain a working radio stream.
+A `radio.example.json` file is included as a configuration example.
+
+Copy or rename it to:
+
+```text
+radio.json
+```
+
+Then replace the placeholder station information with direct HTTP or HTTPS audio stream URLs.
 
 Example:
 
@@ -166,15 +169,27 @@ Example:
 }
 ```
 
-`name` and `url` are required. `genre` is optional. Online Radio is intended for direct audio stream URLs rather than station web pages or playlist landing pages.
+`name` and `url` are required.
 
-SMB shares are mounted temporarily under:
+`genre` is optional and is displayed in the station list.
+
+Online Radio is intended for **direct audio stream URLs**, not station web pages or playlist landing pages.
+
+### Supported Radio Formats
+
+Online Radio supports:
 
 ```text
-/tmp/misterhifi-mnt/
+MP3
+FLAC
+Ogg FLAC
+Ogg Vorbis
+WAV / PCM
 ```
 
-No network shares are mounted inside the MiSTer Hi-Fi configuration folder.
+Raw AAC, AAC+ / HE-AAC, Opus, and Ogg Opus streams are not currently supported.
+
+AAC and ALAC remain supported when contained in normal M4A/MP4 music files. Support for M4A files does not imply support for raw AAC internet radio streams.
 
 ## Launching
 
@@ -182,12 +197,6 @@ Open MiSTer Hi-Fi normally:
 
 ```bash
 /media/fat/Scripts/misterhifi.sh
-```
-
-Show the installed version:
-
-```bash
-/media/fat/Scripts/misterhifi.sh --version
 ```
 
 Play a single file directly:
@@ -202,7 +211,7 @@ Play a folder as an album:
 /media/fat/Scripts/misterhifi.sh "/media/fat/Music/Artist/Album"
 ```
 
-The first supported audio file in the folder starts automatically and the remaining tracks become the album queue.
+The first supported audio file in the folder starts automatically and the remaining supported tracks become the album queue.
 
 Play a playlist directly:
 
@@ -214,33 +223,39 @@ External single-file launches only play the requested file.
 
 ## NFC / Zaparoo
 
+MiSTer Hi-Fi can be launched directly through Zaparoo using NFC tags.
+
 Write a MiSTer script command to the NFC tag.
 
-Single file:
+### Single File
 
 ```text
 **mister.script:misterhifi.sh "/media/fat/Music/song.flac"
 ```
 
-Album folder:
+### Album Folder
 
 ```text
 **mister.script:misterhifi.sh "/media/fat/Music/Artist/Album"
 ```
 
-Playlist:
+### Playlist
 
 ```text
 **mister.script:misterhifi.sh "/media/fat/Music/Playlists/Favorites.m3u"
 ```
 
-For SMB, use the configured share name instead of the temporary mount path:
+### SMB
+
+For SMB content, use the configured share name instead of the temporary mount path:
 
 ```text
 **mister.script:misterhifi.sh "smb://Music NAS/Artist/Album"
 ```
 
-When MiSTer Hi-Fi is already running, later Zaparoo scans are sent directly to the active player. The application does not restart. The current queue is replaced and the new track, album or playlist starts immediately.
+When MiSTer Hi-Fi is already running, later Zaparoo scans are sent directly to the active player.
+
+The application does not restart. The current queue is replaced and the new track, album, or playlist starts immediately.
 
 ## Controls
 
@@ -269,10 +284,10 @@ Right    Seek Forward 10 Seconds
 The player includes:
 
 ```text
-Previous
+Previous Track
 Play / Pause
 Stop
-Next
+Next Track
 Shuffle
 Repeat
 Equalizer
@@ -282,11 +297,11 @@ Spectrum Visualizer
 
 Playback continues while browsing other sources and folders.
 
-A Now Playing / Paused / Loaded bar remains available while browsing and can be selected to return to the player.
+A **Now Playing**, **Paused**, or **Loaded** bar remains available while browsing and can be selected to return to the player.
 
 ## Audio Information
 
-Now Playing displays the source audio format next to the track number.
+Now Playing displays information about the active audio source next to the track number.
 
 Example:
 
@@ -294,39 +309,23 @@ Example:
 Track: 1 of 12    FLAC    16 bit    44.1 kHz    770 kbps
 ```
 
-The audio information is shown in compact white blocks and includes the media format, bit depth when applicable, sample rate and bitrate. M4A files identify the contained codec as `AAC` or `ALAC`; ALAC reports bit depth when available.
-
-Physical Audio CDs are shown as `CDDA`, `16 bit`, `44.1 kHz` and `1411 kbps`.
-
-## Display Settings
-
-- **OLED Mode** uses a true-black background.
-- **Show Album Art** enables the album-art player layout.
-- **Auto Hide Missing Art** automatically uses the full-width no-art player layout when the current track has no artwork. This option is disabled in Settings while Show Album Art is Off.
-- **Show Clock** displays the MiSTer's 24-hour system clock in the top-right corner on every MiSTer Hi-Fi screen.
-- **Confirm on Exit** asks for confirmation before closing MiSTer Hi-Fi and is enabled by default.
-- **Screensaver** can turn the display completely black after 30 seconds, 1 minute, 2 minutes, 5 minutes, or 10 minutes of inactivity. Any controller or keyboard input wakes the display and the wake input is consumed. The screensaver is Off by default.
-- **Gapless Playback (Experimental)** enables seamless natural track-to-track transitions for FLAC, WAV and physical Audio CD (CDDA) playback. MP3 is intentionally excluded. The setting is Off by default.
-- **Swap A/B** and **Swap X/Y** change physical controller behavior without changing the on-screen button labels.
-- **Custom Fallback Font** optionally uses a user-provided `.ttf` or compatible `.otf` font only for characters that are not available in MiSTer Hi-Fi's built-in bitmap font. The built-in font remains the primary font. The setting is Off by default and is disabled when no valid custom fonts are found.
-
-## Custom Fallback Fonts
-
-MiSTer Hi-Fi automatically creates:
+Depending on the source, the information can include:
 
 ```text
-/media/fat/Scripts/.config/MiSTerHiFi/fonts/
+Audio Format
+Codec
+Bit Depth
+Sample Rate
+Bitrate
 ```
 
-Place user-provided `.ttf` or compatible `.otf` font files in this folder. Valid fonts appear automatically under **Settings > Custom Fallback Font** using the font filename without its extension.
+M4A files identify their contained codec as `AAC` or `ALAC`. ALAC also reports bit depth when available.
 
-Custom Fallback Font defaults to **Off**. When the folder contains no valid fonts, the setting is greyed out. If a previously selected font is removed, MiSTer Hi-Fi safely falls back to Off.
+Physical Audio CDs are shown as:
 
-The custom font does not replace MiSTer Hi-Fi's built-in bitmap font. It is used only as a fallback for characters the built-in font cannot display, such as Japanese or accented characters. Fallback glyphs inherit the existing MiSTer Hi-Fi text scale, line layout, clipping and alignment rather than introducing a separate user-controlled font size.
-
-No fonts are included with MiSTer Hi-Fi. Users are responsible for ensuring they have permission to use any font files they add.
-
-MiSTer Hi-Fi uses `stb_truetype` to rasterize supported user fonts. Its license is included in the source repository under `licenses/stb-LICENSE.txt`.
+```text
+CDDA    16 bit    44.1 kHz    1411 kbps
+```
 
 ## Equalizer
 
@@ -346,21 +345,82 @@ The equalizer is applied directly to the active playback path.
 
 ## Settings
 
-MiSTer Hi-Fi includes the following application settings:
+MiSTer Hi-Fi includes settings for playback, display, controls, and fonts.
+
+### OLED Mode
+
+Uses a true-black background.
+
+### Show Album Art
+
+Enables the album-art player layout.
+
+When disabled, the player uses the full available width for track information, progress seeking, the visualizer, and playback controls.
+
+### Auto Hide Missing Art
+
+Automatically switches to the full-width no-art layout when the current track has no artwork.
+
+This option is unavailable while **Show Album Art** is disabled.
+
+### Show Clock
+
+Displays the MiSTer's 24-hour system clock in the top-right corner.
+
+### Confirm on Exit
+
+Asks for confirmation before closing MiSTer Hi-Fi.
+
+This is enabled by default.
+
+### Screensaver
+
+Turns the display completely black after a selected period of inactivity.
+
+Available intervals:
 
 ```text
-OLED Mode
-Show Album Art
-Swap A/B
-Swap X/Y
-Custom Fallback Font
+30 Seconds
+1 Minute
+2 Minutes
+5 Minutes
+10 Minutes
+Off
 ```
 
-**OLED Mode** changes the main application background from dark grey to true black.
+Any controller or keyboard input wakes the display. The wake input itself is consumed and is not passed to the application.
 
-**Show Album Art** controls whether artwork is shown in Now Playing. When disabled, the player reflows to use the full width for track information, progress seeking, the visualizer and centered playback controls.
+### Gapless Playback
 
-**Swap A/B** and **Swap X/Y** change the physical controller button behavior without changing the button labels shown in the interface. This makes it possible to use Nintendo-, Xbox- or PlayStation-style controller layouts while keeping MiSTer Hi-Fi's on-screen controls consistent.
+Enables seamless natural track-to-track transitions where supported.
+
+Gapless playback is available for:
+
+```text
+FLAC
+WAV
+Physical Audio CD / CDDA
+```
+
+MP3 is intentionally excluded.
+
+Gapless playback is experimental and disabled by default.
+
+### Swap A/B
+
+Swaps the physical behavior of the A and B buttons without changing their on-screen labels.
+
+### Swap X/Y
+
+Swaps the physical behavior of the X and Y buttons without changing their on-screen labels.
+
+These options make it possible to use Nintendo-, Xbox-, or PlayStation-style controller layouts while keeping the MiSTer Hi-Fi interface consistent.
+
+### Custom Fallback Font
+
+Allows a user-provided TrueType or OpenType font to supply characters that are unavailable in MiSTer Hi-Fi's built-in bitmap font.
+
+The built-in font always remains the primary UI font.
 
 Settings are saved automatically in:
 
@@ -368,13 +428,43 @@ Settings are saved automatically in:
 /media/fat/Scripts/.config/MiSTerHiFi/config.json
 ```
 
+## Custom Fallback Fonts
+
+MiSTer Hi-Fi automatically creates:
+
+```text
+/media/fat/Scripts/.config/MiSTerHiFi/fonts/
+```
+
+Place user-provided `.ttf` or compatible `.otf` files in this folder.
+
+Valid fonts automatically appear under:
+
+```text
+Settings > Custom Fallback Font
+```
+
+The font filename is used as its display name.
+
+Custom Fallback Font defaults to **Off**.
+
+If the folder contains no valid fonts, the setting is disabled.
+
+If a previously selected font is removed, MiSTer Hi-Fi safely falls back to **Off**.
+
+The custom font does not replace MiSTer Hi-Fi's built-in bitmap font. It is only used for characters that the built-in font cannot display, such as Japanese or accented characters.
+
+Fallback glyphs follow MiSTer Hi-Fi's existing text scaling, layout, clipping, and alignment.
+
+MiSTer Hi-Fi does not include or distribute custom font files. Users are responsible for ensuring they have permission to use any fonts they add.
+
 ## Building From Source
 
-MiSTer Hi-Fi is written in Go with a small C audio bridge and targets Linux ARMv7.
+MiSTer Hi-Fi is written primarily in Go, with additional native components for audio decoding and playback, and targets Linux ARMv7.
 
-It uses miniaudio for decoding and audio output.
+The main audio path uses **miniaudio**.
 
-The project does not store `miniaudio.h` in the repository. The build script downloads the pinned upstream version automatically.
+M4A/MP4 playback uses a separate **Symphonia** decoder path for AAC-LC and ALAC.
 
 Build:
 
@@ -383,60 +473,82 @@ chmod +x fetch_miniaudio.sh build-mister.sh
 ./build-mister.sh
 ```
 
-The resulting binary is placed at:
+The resulting MiSTer binary is placed at:
 
 ```text
 Scripts/.config/MiSTerHiFi/mister_hifi
 ```
 
-The current build uses:
+The repository does not store `miniaudio.h`. The build process downloads the required upstream miniaudio source automatically.
+
+Building M4A support also requires Rust/Cargo and the following Rust target:
 
 ```text
-miniaudio 0.11.25
+armv7-unknown-linux-gnueabihf
 ```
+
+The build script adds this target automatically when `rustup` is available.
 
 ## Third-Party Software
 
-MiSTer Hi-Fi uses [miniaudio](https://github.com/mackron/miniaudio) by David Reid for audio decoding and playback.
+MiSTer Hi-Fi uses several third-party components.
+
+### miniaudio
+
+[miniaudio](https://github.com/mackron/miniaudio) by David Reid is used for audio decoding and playback.
 
 miniaudio is available under the author's choice of **Public Domain** or the **MIT No Attribution (MIT-0) License**.
 
-MiSTer Hi-Fi does not include `miniaudio.h` in its source repository. `fetch_miniaudio.sh` downloads the pinned upstream version used by the project during the build process.
+### Symphonia
 
-## License
+Symphonia is used for M4A/MP4 AAC and ALAC decoding.
 
-MiSTer Hi-Fi is released under the **GNU General Public License v3.0**.
+It is built with the required ISO/MP4, AAC, and ALAC components.
 
-The GPLv3 license applies to MiSTer Hi-Fi's own source code and does not replace the separate license terms of third-party software such as miniaudio.
+Symphonia is distributed under the **Mozilla Public License 2.0 (MPL-2.0)**.
+
+Its license text is included at:
+
+```text
+licenses/Symphonia-MPL-2.0.txt
+```
+
+### MP4 Metadata
+
+MP4 metadata parsing uses:
+
+```text
+github.com/dhowden/tag
+```
+
+This component is distributed under the **BSD 2-Clause License**.
+
+### stb_truetype
+
+[`stb_truetype`](https://github.com/nothings/stb) is used to parse and rasterize user-provided TrueType/OpenType fallback fonts.
+
+Its license is included in the repository at:
+
+```text
+licenses/stb-LICENSE.txt
+```
 
 ## Known Issues
-
-- Special characters in file or track names are not fully supported yet and may prevent affected tracks from playing. This will be addressed in a future update.
 
 - Zaparoo's **HOLD** mode is currently not compatible with MiSTer Hi-Fi.
 - While MiSTer Hi-Fi is active, Zaparoo cannot process another NFC scan.
 
 ## Notes
 
-MiSTer Hi-Fi does not include music files or album artwork.
+MiSTer Hi-Fi does not include music files, album artwork, radio streams, or custom fonts.
 
-## Custom Fallback Font Rendering and Third-Party Code
+## Credits
 
-MiSTer Hi-Fi uses [`stb_truetype`](https://github.com/nothings/stb) to parse and rasterize user-provided TrueType/OpenType fonts for the optional custom fallback font feature. `stb_truetype` is third-party code and is distributed under its own license, included in the repository's `licenses` folder.
+**Developer:** Anime0t4ku  
+**Contributor:** Phoenix
 
-MiSTer Hi-Fi does not include or distribute custom font files. Users may place their own compatible `.ttf` or `.otf` fonts in the automatically created `fonts` folder. Users are responsible for ensuring they have permission to use any font files they add.
+## License
 
-The built-in MiSTer Hi-Fi bitmap font remains the default and primary UI font. Custom fallback glyphs are automatically rendered slightly larger (about 175% of the built-in bitmap font's nominal pixel height) to better match its visual size, while still scaling proportionally with MiSTer Hi-Fi's existing text sizes and layout. A selected custom font is used only for characters that are not available in the built-in font, while MiSTer Hi-Fi continues to control font sizing and layout.
+MiSTer Hi-Fi is released under the **GNU General Public License v3.0**.
 
-### v1.2.0 metadata reliability
-
-FLAC metadata loading now retries short-lived file read/open failures and only applies parsed metadata after a complete successful metadata pass. This improves metadata reliability on slower or network-backed storage without delaying audio playback.
-
-
-## M4A / Apple Music & iTunes
-
-MiSTer Hi-Fi supports `.m4a` audio containing AAC-LC or Apple Lossless (ALAC). M4A playback uses an isolated Symphonia decoder path, while MP3, FLAC and WAV continue to use the existing miniaudio path. Embedded MP4 metadata and cover artwork are read from the file.
-
-The M4A decoder is built with only Symphonia's ISO/MP4, AAC and ALAC features enabled. Symphonia is licensed under MPL-2.0; its license text is included in `licenses/Symphonia-MPL-2.0.txt`. MP4 tag parsing uses `github.com/dhowden/tag` under BSD-2-Clause.
-
-Building M4A support requires Rust/Cargo and the `armv7-unknown-linux-gnueabihf` Rust target in addition to the existing ARM GCC toolchain. The build script adds the target automatically when `rustup` is available.
+The GPLv3 license applies to MiSTer Hi-Fi's own source code and does not replace the separate licenses of third-party software used by the project.
