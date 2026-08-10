@@ -44,6 +44,8 @@ Music can be browsed directly from the source list.
 
 Physical Audio CDs open directly in the player and automatically start from the first audio track. Press **B** from the player to open the disc track list.
 
+Optical-drive read speed can be limited from **Settings > CD Drive Speed**. This can reduce noise from high-speed CD/DVD drives during Audio CD playback.
+
 ## Supported Audio Formats
 
 MiSTer Hi-Fi supports the following local audio formats:
@@ -68,6 +70,8 @@ Physical Audio CD / CDDA
 M4A files can contain either **AAC-LC** or **Apple Lossless (ALAC)** audio. Embedded MP4 metadata and cover artwork are supported.
 
 When selecting a normal audio file from the built-in browser, MiSTer Hi-Fi treats all supported audio files in the same folder as an album queue.
+
+The browser shows the current position and total number of entries in the active folder, for example `127 / 842`. The synthetic parent-directory entry is not included in the total.
 
 Subfolders are not scanned recursively.
 
@@ -94,6 +98,10 @@ front.png
 Artwork filenames are matched case-insensitively, so names such as `COVER.JPG`, `Folder.PNG`, and `Front.Jpeg` also work.
 
 If no artwork is found, MiSTer Hi-Fi automatically uses the normal no-art player layout.
+
+When **Prioritize External Cover Art** is enabled in Settings, MiSTer Hi-Fi checks for external cover images before scanning supported audio files for embedded artwork. If an external cover is found, the embedded artwork scan is skipped.
+
+External artwork is reused for subsequent tracks from the same folder, avoiding unnecessary reloads and image decoding when an album uses a shared cover file.
 
 ## SMB
 
@@ -191,6 +199,8 @@ Raw AAC, AAC+ / HE-AAC, Opus, and Ogg Opus streams are not currently supported.
 
 AAC and ALAC remain supported when contained in normal M4A/MP4 music files. Support for M4A files does not imply support for raw AAC internet radio streams.
 
+If an Online Radio stream ends unexpectedly, MiSTer Hi-Fi automatically reconnects to the same station. This helps stations that close or restart their stream connection between songs and also improves recovery from short interruptions. Explicitly stopping playback or selecting another station cancels the reconnect.
+
 ## Launching
 
 Open MiSTer Hi-Fi normally:
@@ -259,6 +269,8 @@ The application does not restart. The current queue is replaced and the new trac
 
 ## Controls
 
+### Controller
+
 ```text
 D-Pad    Navigate
 A        Select
@@ -271,6 +283,40 @@ Y        Stop / Unload / Return to Track List
 R1       Next Track
 Start    Now Playing
 ```
+
+### Keyboard
+
+```text
+Arrow Keys         Navigate / Adjust
+Enter              Select / Confirm
+Esc / Backspace    Back
+Page Up / Down     Move through long lists
+Home / End         First / Last entry
+Tab                Sources
+O                  Now Playing
+
+Space / P          Play / Pause
+S                  Stop / Unload
+N                  Next Track
+B                  Previous Track
+H                  Toggle Shuffle
+R                  Toggle Repeat
+```
+
+### Media Keys
+
+Dedicated keyboard media controls are also supported where available:
+
+```text
+Play / Pause       Play / Pause
+Play               Play / Resume
+Pause              Pause
+Stop               Stop / Unload
+Next Track         Next Track
+Previous Track     Previous Track
+```
+
+Volume and mute media keys are not handled by MiSTer Hi-Fi because the application does not provide internal volume control.
 
 When the progress bar is selected:
 
@@ -363,6 +409,14 @@ Automatically switches to the full-width no-art layout when the current track ha
 
 This option is unavailable while **Show Album Art** is disabled.
 
+### Prioritize External Cover Art
+
+Checks for external cover images before embedded artwork.
+
+When an external cover is found, embedded artwork is not scanned. This can improve loading speed for formats such as FLAC and avoids unnecessary artwork work when an album already provides a shared external cover image.
+
+External artwork is cached for tracks played from the same folder so the same image does not need to be reloaded for every track.
+
 ### Show Clock
 
 Displays the MiSTer's 24-hour system clock in the top-right corner.
@@ -389,6 +443,32 @@ Off
 ```
 
 Any controller or keyboard input wakes the display. The wake input itself is consumed and is not passed to the application.
+
+### Remember Shuffle / Loop
+
+Remembers the current Shuffle and Loop states between playback queues and application restarts.
+
+When enabled, changes to Shuffle or Loop are saved automatically and restored when a new queue is created. When disabled, MiSTer Hi-Fi uses the normal default states.
+
+### CD Drive Speed
+
+Controls the optical-drive read speed used for Physical Audio CD playback. This can reduce drive noise when using high-speed CD/DVD drives.
+
+Available options:
+
+```text
+Default
+Auto
+1x
+2x
+4x
+8x
+16x
+```
+
+**Default** leaves the drive untouched. **Auto** asks the Linux CD-ROM driver to select the speed automatically. Fixed values request the corresponding CD read speed directly from the drive.
+
+Drive speed control is handled natively by MiSTer Hi-Fi and does not require `setcd` or any additional package. Support for individual requested speeds depends on the optical drive.
 
 ### Gapless Playback
 

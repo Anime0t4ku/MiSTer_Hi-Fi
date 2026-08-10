@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.4.1"
+const version = "1.5.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -43,18 +43,23 @@ var screenSaverSeconds atomic.Int64
 var screenSaverActive atomic.Bool
 
 type Config struct {
-	EQ                 EQConfig `json:"eq"`
-	Visualizer         string   `json:"visualizer"`
-	OLEDMode           bool     `json:"oled_mode"`
-	HideAlbumArt       bool     `json:"hide_album_art"`
-	AutoHideMissingArt bool     `json:"auto_hide_missing_art"`
-	ShowClock          bool     `json:"show_clock"`
-	ConfirmOnExit      bool     `json:"confirm_on_exit"`
-	ScreenSaverSeconds int      `json:"screensaver_seconds"`
-	GaplessPlayback    bool     `json:"gapless_playback"`
-	SwapAB             bool     `json:"swap_ab"`
-	SwapXY             bool     `json:"swap_xy"`
-	CustomFont         string   `json:"custom_font"`
+	EQ                    EQConfig `json:"eq"`
+	Visualizer            string   `json:"visualizer"`
+	OLEDMode              bool     `json:"oled_mode"`
+	HideAlbumArt          bool     `json:"hide_album_art"`
+	AutoHideMissingArt    bool     `json:"auto_hide_missing_art"`
+	PrioritizeExternalArt bool     `json:"prioritize_external_art"`
+	RememberShuffleLoop   bool     `json:"remember_shuffle_loop"`
+	CDDriveSpeed          int      `json:"cd_drive_speed"`
+	SavedShuffle          bool     `json:"saved_shuffle"`
+	SavedLoop             bool     `json:"saved_loop"`
+	ShowClock             bool     `json:"show_clock"`
+	ConfirmOnExit         bool     `json:"confirm_on_exit"`
+	ScreenSaverSeconds    int      `json:"screensaver_seconds"`
+	GaplessPlayback       bool     `json:"gapless_playback"`
+	SwapAB                bool     `json:"swap_ab"`
+	SwapXY                bool     `json:"swap_xy"`
+	CustomFont            string   `json:"custom_font"`
 }
 type EQConfig struct {
 	Enabled                            bool `json:"enabled"`
@@ -121,32 +126,60 @@ const (
 	actPrev
 	actNext
 	actPlayPause
+	actPlay
+	actPause
 	actStop
 	actNowPlaying
 	actSources
+	actPageUp
+	actPageDown
+	actFirst
+	actLast
+	actShuffle
+	actLoop
 	actWake
 )
 const (
-	evKey    = 1
-	evAbs    = 3
-	keyEsc   = 1
-	keyEnter = 28
-	keyUp    = 103
-	keyLeft  = 105
-	keyRight = 106
-	keyDown  = 108
-	keyBack  = 158
-	btnSouth = 304
-	btnEast  = 305
-	btnTL    = 310
-	btnTR    = 311
-	btnNorth = 307
-	btnWest  = 308
-	btnStart = 315
-	btnMode  = 316
-	keyHome  = 102
-	absHatX  = 16
-	absHatY  = 17
+	evKey           = 1
+	evAbs           = 3
+	keyEsc          = 1
+	keyBackspace    = 14
+	keyTab          = 15
+	keyR            = 19
+	keyO            = 24
+	keyP            = 25
+	keyEnter        = 28
+	keyS            = 31
+	keyH            = 35
+	keyB            = 48
+	keyN            = 49
+	keySpace        = 57
+	keyUp           = 103
+	keyLeft         = 105
+	keyRight        = 106
+	keyDown         = 108
+	keyBack         = 158
+	btnSouth        = 304
+	btnEast         = 305
+	btnTL           = 310
+	btnTR           = 311
+	btnNorth        = 307
+	btnWest         = 308
+	btnStart        = 315
+	btnMode         = 316
+	keyHome         = 102
+	keyPageUp       = 104
+	keyEnd          = 107
+	keyPageDown     = 109
+	keyPause        = 119
+	keyStop         = 128
+	keyNextSong     = 163
+	keyPlayPause    = 164
+	keyPreviousSong = 165
+	keyStopCD       = 166
+	keyPlay         = 207
+	absHatX         = 16
+	absHatY         = 17
 )
 
 var font = map[rune][7]byte{
@@ -515,9 +548,37 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 							a = actDown
 						case keyEnter:
 							a = actConfirm
-						case keyEsc, keyBack:
+						case keyTab:
+							a = actSources
+						case keyO:
+							a = actNowPlaying
+						case keyEsc, keyBackspace, keyBack:
 							a = actBack
-						case keyHome, btnMode:
+						case keyPageUp:
+							a = actPageUp
+						case keyPageDown:
+							a = actPageDown
+						case keyHome:
+							a = actFirst
+						case keyEnd:
+							a = actLast
+						case keySpace, keyP, keyPlayPause:
+							a = actPlayPause
+						case keyS, keyStop, keyStopCD:
+							a = actStop
+						case keyN, keyNextSong:
+							a = actNext
+						case keyB, keyPreviousSong:
+							a = actPrev
+						case keyPlay:
+							a = actPlay
+						case keyPause:
+							a = actPause
+						case keyR:
+							a = actLoop
+						case keyH:
+							a = actShuffle
+						case btnMode:
 							a = actSources
 						case btnSouth:
 							if swapABInput.Load() {
@@ -605,7 +666,7 @@ func (t *termState) restore() {
 }
 
 func defaultConfig() Config {
-	return Config{Visualizer: "bars", ConfirmOnExit: true}
+	return Config{Visualizer: "bars", ConfirmOnExit: true, CDDriveSpeed: -1}
 }
 func loadConfig() Config {
 	c := defaultConfig()
@@ -634,8 +695,14 @@ func loadConfig() Config {
 	if _, ok := raw["confirm_on_exit"]; !ok {
 		c.ConfirmOnExit = true
 	}
+	if _, ok := raw["cd_drive_speed"]; !ok {
+		c.CDDriveSpeed = -1
+	}
 	if c.Visualizer == "" {
 		c.Visualizer = "bars"
+	}
+	if !validCDDriveSpeed(c.CDDriveSpeed) {
+		c.CDDriveSpeed = -1
 	}
 	saveConfig(c)
 	return c
@@ -1045,15 +1112,21 @@ func trackFromPath(p string) Track {
 	return t
 }
 
-func trackFromTrack(src Track) Track {
+func externalArtworkForTrack(t Track) image.Image {
+	if t.UseDirFD && t.DirFD >= 0 {
+		return folderArtworkAt(t.DirFD)
+	}
+	return folderArtwork(filepath.Dir(t.Path))
+}
+
+func trackFromTrack(src Track, prioritizeExternalArt bool) Track {
 	t := src
+	if prioritizeExternalArt && t.Art == nil {
+		t.Art = externalArtworkForTrack(t)
+	}
 	readBasicTags(&t)
 	if t.Art == nil {
-		if t.UseDirFD && t.DirFD >= 0 {
-			t.Art = folderArtworkAt(t.DirFD)
-		} else {
-			t.Art = folderArtwork(filepath.Dir(t.Path))
-		}
+		t.Art = externalArtworkForTrack(t)
 	}
 	return t
 }
@@ -1133,9 +1206,11 @@ func readM4A(t *Track) bool {
 	if v := strings.TrimSpace(m.Album()); v != "" {
 		t.Album = v
 	}
-	if p := m.Picture(); p != nil && len(p.Data) > 0 {
-		if im, _, err := image.Decode(bytes.NewReader(p.Data)); err == nil {
-			t.Art = im
+	if t.Art == nil {
+		if p := m.Picture(); p != nil && len(p.Data) > 0 {
+			if im, _, err := image.Decode(bytes.NewReader(p.Data)); err == nil {
+				t.Art = im
+			}
 		}
 	}
 	return true
@@ -1894,11 +1969,32 @@ type Player struct {
 	gaplessQueuedIndex int
 	streamCancel       func()
 	generation         uint64
+	reconnectRadio     bool
+	externalArtMu      sync.Mutex
+	externalArtDir     string
+	externalArt        image.Image
 }
 
-func newPlayer(q Queue, cfg Config) *Player {
-	return &Player{q: q, cfg: cfg, stopped: true, gaplessQueuedIndex: -1}
+func newPlayer(q Queue, cfg Config, reconnectRadio bool) *Player {
+	return &Player{q: q, cfg: cfg, stopped: true, gaplessQueuedIndex: -1, reconnectRadio: reconnectRadio}
 }
+
+func (p *Player) externalArtworkForTrackCached(t Track) image.Image {
+	dir := filepath.Clean(filepath.Dir(t.Path))
+	p.externalArtMu.Lock()
+	defer p.externalArtMu.Unlock()
+
+	if p.externalArt != nil && p.externalArtDir == dir {
+		return p.externalArt
+	}
+	im := externalArtworkForTrack(t)
+	if im != nil {
+		p.externalArtDir = dir
+		p.externalArt = im
+	}
+	return im
+}
+
 func mergeTrackMetadata(dst *Track, src Track) {
 	if src.Title != "" {
 		dst.Title = src.Title
@@ -1945,6 +2041,9 @@ func (p *Player) loadCurrentMetadata(index int, src Track) {
 	}
 
 	ext := strings.ToLower(filepath.Ext(src.Path))
+	p.mu.Lock()
+	prioritizeExternalArt := p.cfg.PrioritizeExternalArt
+	p.mu.Unlock()
 
 	if ext == ".flac" {
 		meta := src
@@ -1982,23 +2081,25 @@ func (p *Player) loadCurrentMetadata(index int, src Track) {
 	go func() {
 		t := src
 		if ext == ".flac" {
+			if prioritizeExternalArt && t.Art == nil {
+				t.Art = p.externalArtworkForTrackCached(t)
+			}
 			if t.Art == nil {
 				t.Art = readFLACArtworkWithRetry(&t)
 			}
 			if t.Art == nil {
 				for attempt := 0; attempt < 3 && t.Art == nil; attempt++ {
-					if t.UseDirFD && t.DirFD >= 0 {
-						t.Art = folderArtworkAt(t.DirFD)
-					} else {
-						t.Art = folderArtwork(filepath.Dir(t.Path))
-					}
+					t.Art = externalArtworkForTrack(t)
 					if t.Art == nil && attempt < 2 {
 						time.Sleep(time.Duration(150*(attempt+1)) * time.Millisecond)
 					}
 				}
 			}
 		} else {
-			t = trackFromTrack(src)
+			if prioritizeExternalArt && t.Art == nil {
+				t.Art = p.externalArtworkForTrackCached(t)
+			}
+			t = trackFromTrack(t, false)
 		}
 		p.commitTrackMetadata(index, src.Path, t)
 	}()
@@ -2187,6 +2288,14 @@ func (p *Player) monitorPlayback(stop <-chan struct{}, generation uint64) {
 				p.handleGaplessTransitionUnlocked()
 			}
 			if ended {
+				p.mu.Lock()
+				reconnectRadio := p.reconnectRadio
+				p.mu.Unlock()
+				if reconnectRadio {
+					p.opMu.Unlock()
+					go p.reconnectRadioStream(stop, generation)
+					return
+				}
 				p.advanceUnlocked(generation, stop)
 				p.opMu.Unlock()
 				return
@@ -2195,6 +2304,66 @@ func (p *Player) monitorPlayback(stop <-chan struct{}, generation uint64) {
 		}
 	}
 }
+
+func (p *Player) reconnectRadioStream(stop <-chan struct{}, generation uint64) {
+	const retryDelay = time.Second
+	for {
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-stop:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+
+		p.opMu.Lock()
+		p.mu.Lock()
+		current := p.reconnectRadio && p.stop == stop && p.generation == generation && !p.stopped &&
+			p.q.Index >= 0 && p.q.Index < len(p.q.Tracks) && isHTTPURL(p.q.Tracks[p.q.Index].Path)
+		if !current {
+			p.mu.Unlock()
+			p.opMu.Unlock()
+			return
+		}
+		t := p.q.Tracks[p.q.Index]
+		cfg := p.cfg
+		oldCancel := p.streamCancel
+		p.streamCancel = nil
+		p.mu.Unlock()
+
+		if oldCancel != nil {
+			oldCancel()
+		}
+		nativeAudioStop()
+		cancel, err := nativeAudioStartURL(t.Path, cfg.EQ)
+		if err != nil {
+			p.opMu.Unlock()
+			continue
+		}
+
+		p.mu.Lock()
+		current = p.reconnectRadio && p.stop == stop && p.generation == generation && !p.stopped
+		if current {
+			p.streamCancel = cancel
+			p.paused = false
+			p.basePosition = 0
+		}
+		p.mu.Unlock()
+		p.opMu.Unlock()
+		if !current {
+			if cancel != nil {
+				cancel()
+			}
+			nativeAudioStop()
+			return
+		}
+		go p.monitorPlayback(stop, generation)
+		return
+	}
+}
+
 func parseCDDAPath(path string) (string, int32, int32, error) {
 	x := strings.TrimPrefix(path, "cdda:")
 	i2 := strings.LastIndex(x, ":")
@@ -2231,6 +2400,9 @@ func (p *Player) playCDTrack(t Track, stop <-chan struct{}) error {
 		if start >= end {
 			start = end - 1
 		}
+	}
+	if p.cfg.CDDriveSpeed >= 0 {
+		_ = setCDDriveSpeed(dev, p.cfg.CDDriveSpeed)
 	}
 	f, e := os.Open(dev)
 	if e != nil {
@@ -2470,6 +2642,36 @@ func (p *Player) togglePause() {
 	p.mu.Unlock()
 	nativeAudioPause(paused)
 }
+func (p *Player) playOrResume() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.mu.Lock()
+	stopped := p.stopped
+	paused := p.paused
+	p.mu.Unlock()
+	if stopped {
+		_ = p.playCurrentUnlocked()
+		return
+	}
+	if paused {
+		p.mu.Lock()
+		p.paused = false
+		p.mu.Unlock()
+		nativeAudioPause(false)
+	}
+}
+func (p *Player) pause() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.mu.Lock()
+	if p.stopped || p.paused {
+		p.mu.Unlock()
+		return
+	}
+	p.paused = true
+	p.mu.Unlock()
+	nativeAudioPause(true)
+}
 func (p *Player) seekBy(seconds float64) {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
@@ -2604,6 +2806,10 @@ func closeQueueDirFD(q *Queue) {
 }
 
 func (a *App) startQueue(q Queue, origin *browseOrigin) error {
+	if a.cfg.RememberShuffleLoop {
+		q.Shuffle = a.cfg.SavedShuffle
+		q.Repeat = a.cfg.SavedLoop
+	}
 	if a.player != nil {
 		old := a.player
 		a.player = nil
@@ -2611,7 +2817,8 @@ func (a *App) startQueue(q Queue, origin *browseOrigin) error {
 		old.stopPlaybackRaw()
 		closeQueueDirFD(&old.q)
 	}
-	p := newPlayer(q, *a.cfg)
+	reconnectRadio := origin != nil && origin.Kind == "radio"
+	p := newPlayer(q, *a.cfg, reconnectRadio)
 	if err := p.playCurrent(); err != nil {
 		closeQueueDirFD(&q)
 		return err
@@ -2669,8 +2876,34 @@ func (a *App) handlePlaybackShortcut(act action) bool {
 	case actPlayPause:
 		a.player.togglePause()
 		return true
+	case actPlay:
+		a.player.playOrResume()
+		return true
+	case actPause:
+		a.player.pause()
+		return true
 	case actStop:
 		a.stopAndUnload()
+		return true
+	case actShuffle:
+		a.player.mu.Lock()
+		a.player.q.Shuffle = !a.player.q.Shuffle
+		shuffle := a.player.q.Shuffle
+		a.player.mu.Unlock()
+		if a.cfg.RememberShuffleLoop {
+			a.cfg.SavedShuffle = shuffle
+			saveConfig(*a.cfg)
+		}
+		return true
+	case actLoop:
+		a.player.mu.Lock()
+		a.player.q.Repeat = !a.player.q.Repeat
+		loop := a.player.q.Repeat
+		a.player.mu.Unlock()
+		if a.cfg.RememberShuffleLoop {
+			a.cfg.SavedLoop = loop
+			saveConfig(*a.cfg)
+		}
 		return true
 	}
 	return false
@@ -2815,6 +3048,10 @@ func drawNowPlayingBar(app *App, selected bool) int {
 }
 
 func menu(app *App, title string, items []string, initial int) (int, bool) {
+	return menuWithEntryCounter(app, title, items, initial, false)
+}
+
+func menuWithEntryCounter(app *App, title string, items []string, initial int, showEntryCounter bool) (int, bool) {
 	fb, acts := app.fb, app.acts
 	clockTick := time.NewTicker(30 * time.Second)
 	defer clockTick.Stop()
@@ -2874,6 +3111,16 @@ func menu(app *App, title string, items []string, initial int) (int, bool) {
 			drawNowPlayingBar(app, barSel)
 		}
 		drawBrowserFooter(fb, true)
+		if showEntryCounter && !barSel {
+			total := len(items) - 1
+			current := sel
+			if current < 0 || current > total {
+				current = 0
+			}
+			counter := fmt.Sprintf("%d / %d", current, total)
+			scale := max(1, fb.h/540)
+			fb.text(fb.w-30-tw(scale, counter), fb.h-max(25, scale*12), scale, counter, color.RGBA{160, 160, 165, 255})
+		}
 		drawClock(fb, app.cfg, appBackground(app.cfg))
 		fb.present()
 		var a action
@@ -2921,6 +3168,38 @@ func menu(app *App, title string, items []string, initial int) (int, bool) {
 						break
 					}
 				}
+			}
+		case actPageUp:
+			if !barSel {
+				sel -= 10
+				if sel < 0 {
+					sel = 0
+				}
+				for sel > 0 && items[sel] == "" {
+					sel--
+				}
+			}
+		case actPageDown:
+			if !barSel {
+				sel += 10
+				if sel >= len(items) {
+					sel = len(items) - 1
+				}
+				for sel < len(items)-1 && items[sel] == "" {
+					sel++
+				}
+			}
+		case actFirst:
+			barSel = false
+			sel = 0
+			for sel < len(items)-1 && items[sel] == "" {
+				sel++
+			}
+		case actLast:
+			barSel = false
+			sel = len(items) - 1
+			for sel > 0 && items[sel] == "" {
+				sel--
 			}
 		case actDown:
 			moved := false
@@ -3094,7 +3373,7 @@ func browse(app *App, root, startDir, initialName string) (browseChoice, bool) {
 			}
 		}
 		focusName = ""
-		i, ok := menu(app, "BROWSE: "+short(dir, 32), items, initial)
+		i, ok := menuWithEntryCounter(app, "BROWSE: "+short(dir, 32), items, initial, true)
 		if !ok {
 			if app.jumpSources || len(stack) == 1 {
 				return browseChoice{}, false
@@ -3653,6 +3932,22 @@ func playerUI(app *App) {
 			case actPlayPause:
 				p.togglePause()
 				redrawControls = true
+			case actPlay:
+				p.playOrResume()
+				redrawControls = true
+			case actPause:
+				p.pause()
+				redrawControls = true
+			case actShuffle, actLoop:
+				if app.handlePlaybackShortcut(a) {
+					redrawControls = true
+				}
+			case actFirst:
+				sel = 1
+				redrawControls = true
+			case actLast:
+				sel = 7
+				redrawControls = true
 			case actStop:
 				external := app.origin == nil
 				app.stopAndUnload()
@@ -3691,12 +3986,22 @@ func playerUI(app *App) {
 				case 5:
 					p.mu.Lock()
 					p.q.Shuffle = !p.q.Shuffle
+					shuffle := p.q.Shuffle
 					p.mu.Unlock()
+					if cfg.RememberShuffleLoop {
+						cfg.SavedShuffle = shuffle
+						saveConfig(*cfg)
+					}
 					redrawControls = true
 				case 6:
 					p.mu.Lock()
 					p.q.Repeat = !p.q.Repeat
+					loop := p.q.Repeat
 					p.mu.Unlock()
+					if cfg.RememberShuffleLoop {
+						cfg.SavedLoop = loop
+						saveConfig(*cfg)
+					}
 					redrawControls = true
 				case 7:
 					eqUI(app)
@@ -3904,6 +4209,7 @@ const (
 	cdromReadTOCHdr   = 0x5305
 	cdromReadTOCEntry = 0x5306
 	cdromReadAudio    = 0x530e
+	cdromSelectSpeed  = 0x5322
 	cdromLBAMode      = 0x01
 	cdromLeadout      = 0xaa
 	cdFrameBytes      = 2352
@@ -3915,6 +4221,64 @@ func cdIoctl(fd uintptr, req uintptr, arg unsafe.Pointer) error {
 		return e
 	}
 	return nil
+}
+
+func validCDDriveSpeed(speed int) bool {
+	switch speed {
+	case -1, 0, 1, 2, 4, 8, 16:
+		return true
+	default:
+		return false
+	}
+}
+
+func cdDriveSpeedLabel(speed int) string {
+	switch speed {
+	case 0:
+		return "AUTO"
+	case 1, 2, 4, 8, 16:
+		return fmt.Sprintf("%dX", speed)
+	default:
+		return "DEFAULT"
+	}
+}
+
+func cycleCDDriveSpeed(current, dir int) int {
+	values := []int{-1, 0, 1, 2, 4, 8, 16}
+	idx := 0
+	for i, v := range values {
+		if v == current {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + dir + len(values)) % len(values)
+	return values[idx]
+}
+
+func setCDDriveSpeed(dev string, speed int) error {
+	if speed < 0 {
+		return nil
+	}
+	f, err := os.OpenFile(dev, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(cdromSelectSpeed), uintptr(speed))
+	if e != 0 {
+		return e
+	}
+	return nil
+}
+
+func applyCDDriveSpeedToDetected(speed int) {
+	if speed < 0 {
+		return
+	}
+	for _, dev := range detectOptical() {
+		_ = setCDDriveSpeed(dev, speed)
+	}
 }
 func readCDTOC(dev string) ([]Track, error) {
 	f, e := os.Open(dev)
@@ -4080,12 +4444,15 @@ func settingsUI(app *App) {
 		"OLED MODE",
 		"SHOW ALBUM ART",
 		"AUTO HIDE MISSING ART",
+		"PRIORITIZE EXTERNAL COVER ART",
+		"REMEMBER SHUFFLE / LOOP",
 		"SHOW CLOCK",
 		"CONFIRM ON EXIT",
 		"SCREENSAVER",
 		"GAPLESS PLAYBACK (EXPERIMENTAL)",
 		"SWAP A/B",
 		"SWAP X/Y",
+		"CD DRIVE SPEED",
 		"CUSTOM FALLBACK FONT",
 	}
 	fonts := scanCustomFonts()
@@ -4098,7 +4465,7 @@ func settingsUI(app *App) {
 		if i == 2 && cfg.HideAlbumArt {
 			return false
 		}
-		if i == 9 && len(fonts) == 0 {
+		if i == 12 && len(fonts) == 0 {
 			return false
 		}
 		return true
@@ -4131,12 +4498,15 @@ func settingsUI(app *App) {
 			onoff(cfg.OLEDMode),
 			onoff(!cfg.HideAlbumArt),
 			onoff(cfg.AutoHideMissingArt),
+			onoff(cfg.PrioritizeExternalArt),
+			onoff(cfg.RememberShuffleLoop),
 			onoff(cfg.ShowClock),
 			onoff(cfg.ConfirmOnExit),
 			screenSaverLabel(cfg.ScreenSaverSeconds),
 			onoff(cfg.GaplessPlayback),
 			onoff(cfg.SwapAB),
 			onoff(cfg.SwapXY),
+			cdDriveSpeedLabel(cfg.CDDriveSpeed),
 			customFontLabel(cfg, fonts),
 		}
 		ts := max(1, row/22)
@@ -4155,21 +4525,33 @@ func settingsUI(app *App) {
 				valueColor = color.RGBA{75, 75, 82, 255}
 				subColor = color.RGBA{70, 70, 76, 255}
 			}
-			hasSub := i == 5 || i == 6 || i == 9
+			hasSub := i == 3 || i == 4 || i == 7 || i == 8 || i == 11 || i == 12
 			labelY := y + 5
 			if hasSub {
 				labelY = y + 1
 			}
 			fb.text(65, labelY, ts, labels[i], labelColor)
-			if i == 5 {
+			if i == 3 {
+				subScale := max(1, ts-1)
+				fb.text(65, labelY+ts*8, subScale, "SKIPS EMBEDDED ARTWORK WHEN AN EXTERNAL COVER IS FOUND", subColor)
+			}
+			if i == 4 {
+				subScale := max(1, ts-1)
+				fb.text(65, labelY+ts*8, subScale, "RESTORES THE LAST SHUFFLE AND LOOP STATES FOR NEW PLAYBACK", subColor)
+			}
+			if i == 7 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, "TURNS THE DISPLAY COMPLETELY BLACK WHILE INACTIVE", subColor)
 			}
-			if i == 6 {
+			if i == 8 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, "FLAC / WAV / CDDA ONLY", subColor)
 			}
-			if i == 9 {
+			if i == 11 {
+				subScale := max(1, ts-1)
+				fb.text(65, labelY+ts*8, subScale, "LIMITS OPTICAL DRIVE READ SPEED DURING AUDIO CD PLAYBACK", subColor)
+			}
+			if i == 12 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, fallbackFontHelp, subColor)
 			}
@@ -4222,17 +4604,32 @@ func settingsUI(app *App) {
 			case 2:
 				cfg.AutoHideMissingArt = !cfg.AutoHideMissingArt
 			case 3:
-				cfg.ShowClock = !cfg.ShowClock
+				cfg.PrioritizeExternalArt = !cfg.PrioritizeExternalArt
+				if app.player != nil {
+					app.player.mu.Lock()
+					app.player.cfg.PrioritizeExternalArt = cfg.PrioritizeExternalArt
+					app.player.mu.Unlock()
+				}
 			case 4:
-				cfg.ConfirmOnExit = !cfg.ConfirmOnExit
+				cfg.RememberShuffleLoop = !cfg.RememberShuffleLoop
+				if cfg.RememberShuffleLoop && app.player != nil {
+					app.player.mu.Lock()
+					cfg.SavedShuffle = app.player.q.Shuffle
+					cfg.SavedLoop = app.player.q.Repeat
+					app.player.mu.Unlock()
+				}
 			case 5:
+				cfg.ShowClock = !cfg.ShowClock
+			case 6:
+				cfg.ConfirmOnExit = !cfg.ConfirmOnExit
+			case 7:
 				dir := 1
 				if a == actLeft {
 					dir = -1
 				}
 				cfg.ScreenSaverSeconds = cycleScreenSaver(cfg.ScreenSaverSeconds, dir)
 				screenSaverSeconds.Store(int64(cfg.ScreenSaverSeconds))
-			case 6:
+			case 8:
 				cfg.GaplessPlayback = !cfg.GaplessPlayback
 				if app.player != nil {
 					app.player.mu.Lock()
@@ -4242,13 +4639,25 @@ func settingsUI(app *App) {
 						app.player.prepareGaplessNextFile()
 					}
 				}
-			case 7:
+			case 9:
 				cfg.SwapAB = !cfg.SwapAB
 				swapABInput.Store(cfg.SwapAB)
-			case 8:
+			case 10:
 				cfg.SwapXY = !cfg.SwapXY
 				swapXYInput.Store(cfg.SwapXY)
-			case 9:
+			case 11:
+				dir := 1
+				if a == actLeft {
+					dir = -1
+				}
+				cfg.CDDriveSpeed = cycleCDDriveSpeed(cfg.CDDriveSpeed, dir)
+				if app.player != nil {
+					app.player.mu.Lock()
+					app.player.cfg.CDDriveSpeed = cfg.CDDriveSpeed
+					app.player.mu.Unlock()
+				}
+				applyCDDriveSpeedToDetected(cfg.CDDriveSpeed)
+			case 12:
 				dir := 1
 				if a == actLeft {
 					dir = -1
