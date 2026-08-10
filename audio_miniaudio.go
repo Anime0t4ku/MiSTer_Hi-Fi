@@ -28,6 +28,13 @@ import (
 
 var nativeAudioControlMu sync.Mutex
 
+var radioHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:             http.ProxyFromEnvironment,
+		DisableKeepAlives: true,
+	},
+}
+
 func nativeAudioStartTrack(t Track, eq EQConfig) error {
 	nativeAudioControlMu.Lock()
 	defer nativeAudioControlMu.Unlock()
@@ -62,7 +69,8 @@ func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
 	req.Header.Set("User-Agent", "MiSTer-Hi-Fi/"+version)
 	req.Header.Set("Icy-MetaData", "0")
 	req.Header.Set("Accept", "audio/*,*/*;q=0.8")
-	resp, err := http.DefaultClient.Do(req)
+	req.Close = true
+	resp, err := radioHTTPClient.Do(req)
 	if err != nil {
 		cancel()
 		return nil, err

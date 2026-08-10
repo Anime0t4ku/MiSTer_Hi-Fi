@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.5.0"
+const version = "1.5.1"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -50,7 +50,6 @@ type Config struct {
 	AutoHideMissingArt    bool     `json:"auto_hide_missing_art"`
 	PrioritizeExternalArt bool     `json:"prioritize_external_art"`
 	RememberShuffleLoop   bool     `json:"remember_shuffle_loop"`
-	CDDriveSpeed          int      `json:"cd_drive_speed"`
 	SavedShuffle          bool     `json:"saved_shuffle"`
 	SavedLoop             bool     `json:"saved_loop"`
 	ShowClock             bool     `json:"show_clock"`
@@ -666,7 +665,7 @@ func (t *termState) restore() {
 }
 
 func defaultConfig() Config {
-	return Config{Visualizer: "bars", ConfirmOnExit: true, CDDriveSpeed: -1}
+	return Config{Visualizer: "bars", ConfirmOnExit: true}
 }
 func loadConfig() Config {
 	c := defaultConfig()
@@ -695,14 +694,8 @@ func loadConfig() Config {
 	if _, ok := raw["confirm_on_exit"]; !ok {
 		c.ConfirmOnExit = true
 	}
-	if _, ok := raw["cd_drive_speed"]; !ok {
-		c.CDDriveSpeed = -1
-	}
 	if c.Visualizer == "" {
 		c.Visualizer = "bars"
-	}
-	if !validCDDriveSpeed(c.CDDriveSpeed) {
-		c.CDDriveSpeed = -1
 	}
 	saveConfig(c)
 	return c
@@ -2400,9 +2393,6 @@ func (p *Player) playCDTrack(t Track, stop <-chan struct{}) error {
 		if start >= end {
 			start = end - 1
 		}
-	}
-	if p.cfg.CDDriveSpeed >= 0 {
-		_ = setCDDriveSpeed(dev, p.cfg.CDDriveSpeed)
 	}
 	f, e := os.Open(dev)
 	if e != nil {
@@ -4209,7 +4199,6 @@ const (
 	cdromReadTOCHdr   = 0x5305
 	cdromReadTOCEntry = 0x5306
 	cdromReadAudio    = 0x530e
-	cdromSelectSpeed  = 0x5322
 	cdromLBAMode      = 0x01
 	cdromLeadout      = 0xaa
 	cdFrameBytes      = 2352
@@ -4221,64 +4210,6 @@ func cdIoctl(fd uintptr, req uintptr, arg unsafe.Pointer) error {
 		return e
 	}
 	return nil
-}
-
-func validCDDriveSpeed(speed int) bool {
-	switch speed {
-	case -1, 0, 1, 2, 4, 8, 16:
-		return true
-	default:
-		return false
-	}
-}
-
-func cdDriveSpeedLabel(speed int) string {
-	switch speed {
-	case 0:
-		return "AUTO"
-	case 1, 2, 4, 8, 16:
-		return fmt.Sprintf("%dX", speed)
-	default:
-		return "DEFAULT"
-	}
-}
-
-func cycleCDDriveSpeed(current, dir int) int {
-	values := []int{-1, 0, 1, 2, 4, 8, 16}
-	idx := 0
-	for i, v := range values {
-		if v == current {
-			idx = i
-			break
-		}
-	}
-	idx = (idx + dir + len(values)) % len(values)
-	return values[idx]
-}
-
-func setCDDriveSpeed(dev string, speed int) error {
-	if speed < 0 {
-		return nil
-	}
-	f, err := os.OpenFile(dev, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(cdromSelectSpeed), uintptr(speed))
-	if e != 0 {
-		return e
-	}
-	return nil
-}
-
-func applyCDDriveSpeedToDetected(speed int) {
-	if speed < 0 {
-		return
-	}
-	for _, dev := range detectOptical() {
-		_ = setCDDriveSpeed(dev, speed)
-	}
 }
 func readCDTOC(dev string) ([]Track, error) {
 	f, e := os.Open(dev)
@@ -4452,7 +4383,6 @@ func settingsUI(app *App) {
 		"GAPLESS PLAYBACK (EXPERIMENTAL)",
 		"SWAP A/B",
 		"SWAP X/Y",
-		"CD DRIVE SPEED",
 		"CUSTOM FALLBACK FONT",
 	}
 	fonts := scanCustomFonts()
@@ -4465,7 +4395,7 @@ func settingsUI(app *App) {
 		if i == 2 && cfg.HideAlbumArt {
 			return false
 		}
-		if i == 12 && len(fonts) == 0 {
+		if i == 11 && len(fonts) == 0 {
 			return false
 		}
 		return true
@@ -4506,7 +4436,6 @@ func settingsUI(app *App) {
 			onoff(cfg.GaplessPlayback),
 			onoff(cfg.SwapAB),
 			onoff(cfg.SwapXY),
-			cdDriveSpeedLabel(cfg.CDDriveSpeed),
 			customFontLabel(cfg, fonts),
 		}
 		ts := max(1, row/22)
@@ -4525,7 +4454,7 @@ func settingsUI(app *App) {
 				valueColor = color.RGBA{75, 75, 82, 255}
 				subColor = color.RGBA{70, 70, 76, 255}
 			}
-			hasSub := i == 3 || i == 4 || i == 7 || i == 8 || i == 11 || i == 12
+			hasSub := i == 3 || i == 4 || i == 7 || i == 8 || i == 11
 			labelY := y + 5
 			if hasSub {
 				labelY = y + 1
@@ -4548,10 +4477,6 @@ func settingsUI(app *App) {
 				fb.text(65, labelY+ts*8, subScale, "FLAC / WAV / CDDA ONLY", subColor)
 			}
 			if i == 11 {
-				subScale := max(1, ts-1)
-				fb.text(65, labelY+ts*8, subScale, "LIMITS OPTICAL DRIVE READ SPEED DURING AUDIO CD PLAYBACK", subColor)
-			}
-			if i == 12 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, fallbackFontHelp, subColor)
 			}
@@ -4646,18 +4571,6 @@ func settingsUI(app *App) {
 				cfg.SwapXY = !cfg.SwapXY
 				swapXYInput.Store(cfg.SwapXY)
 			case 11:
-				dir := 1
-				if a == actLeft {
-					dir = -1
-				}
-				cfg.CDDriveSpeed = cycleCDDriveSpeed(cfg.CDDriveSpeed, dir)
-				if app.player != nil {
-					app.player.mu.Lock()
-					app.player.cfg.CDDriveSpeed = cfg.CDDriveSpeed
-					app.player.mu.Unlock()
-				}
-				applyCDDriveSpeedToDetected(cfg.CDDriveSpeed)
-			case 12:
 				dir := 1
 				if a == actLeft {
 					dir = -1

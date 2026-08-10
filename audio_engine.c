@@ -38,6 +38,8 @@ typedef struct {
     int fd;
     ma_uint64 pos;
     ma_uint64 physical_pos;
+    ma_uint64 logical_base;
+    ma_uint64 replay_base;
     unsigned char* replay;
     size_t replay_size;
     size_t replay_cap;
@@ -103,6 +105,25 @@ static int g_pcm_writer_blocked = 1;
 static const float g_eq_freq[5] = {60.0f,250.0f,1000.0f,4000.0f,12000.0f};
 static const float g_viz_freq[10] = {60.0f,120.0f,250.0f,500.0f,1000.0f,2000.0f,4000.0f,8000.0f,12000.0f,16000.0f};
 
+static void mh_source_cache_append(mh_fd_source* src, const unsigned char* data, size_t len, ma_uint64 start) {
+    if (!src || !src->replay || src->replay_cap == 0 || !data || len == 0) return;
+    if (len >= src->replay_cap) {
+        memcpy(src->replay, data + (len - src->replay_cap), src->replay_cap);
+        src->replay_base = start + (ma_uint64)(len - src->replay_cap);
+        src->replay_size = src->replay_cap;
+        return;
+    }
+    if (src->replay_size == 0) src->replay_base = start;
+    size_t overflow = src->replay_size + len > src->replay_cap ? src->replay_size + len - src->replay_cap : 0;
+    if (overflow > 0) {
+        memmove(src->replay, src->replay + overflow, src->replay_size - overflow);
+        src->replay_base += (ma_uint64)overflow;
+        src->replay_size -= overflow;
+    }
+    memcpy(src->replay + src->replay_size, data, len);
+    src->replay_size += len;
+}
+
 static size_t mh_source_read(mh_fd_source* src, void* pBufferOut, size_t bytesToRead) {
     if (!src || src->fd < 0 || !pBufferOut || bytesToRead == 0) return 0;
     unsigned char* out = (unsigned char*)pBufferOut;
@@ -110,11 +131,13 @@ static size_t mh_source_read(mh_fd_source* src, void* pBufferOut, size_t bytesTo
 
     while (done < bytesToRead) {
         if (src->pos < src->physical_pos) {
-            if (src->pos >= src->replay_size) return done;
-            ma_uint64 cached64 = (ma_uint64)src->replay_size - src->pos;
+            ma_uint64 replay_end = src->replay_base + (ma_uint64)src->replay_size;
+            if (src->pos < src->replay_base || src->pos >= replay_end) return done;
+            size_t offset = (size_t)(src->pos - src->replay_base);
             size_t need = bytesToRead - done;
-            size_t cached = cached64 > (ma_uint64)need ? need : (size_t)cached64;
-            memcpy(out + done, src->replay + (size_t)src->pos, cached);
+            size_t cached = src->replay_size - offset;
+            if (cached > need) cached = need;
+            memcpy(out + done, src->replay + offset, cached);
             src->pos += (ma_uint64)cached;
             done += cached;
             continue;
@@ -138,22 +161,13 @@ static size_t mh_source_read(mh_fd_source* src, void* pBufferOut, size_t bytesTo
             }
             if (pfd.revents & POLLNVAL) return done;
             do { n = read(src->fd, out + done, bytesToRead - done); } while (n < 0 && errno == EINTR);
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                continue;
-            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
             break;
         }
         if (n <= 0) break;
 
-        if (src->physical_pos < src->replay_cap) {
-            size_t room = src->replay_cap - (size_t)src->physical_pos;
-            size_t keep = (size_t)n < room ? (size_t)n : room;
-            if (keep > 0) {
-                memcpy(src->replay + (size_t)src->physical_pos, out + done, keep);
-                size_t end = (size_t)src->physical_pos + keep;
-                if (end > src->replay_size) src->replay_size = end;
-            }
-        }
+        ma_uint64 fresh_start = src->physical_pos;
+        mh_source_cache_append(src, out + done, (size_t)n, fresh_start);
         src->physical_pos += (ma_uint64)n;
         src->pos += (ma_uint64)n;
         done += (size_t)n;
@@ -203,6 +217,8 @@ static mh_fd_source* mh_fd_source_dup(int fd) {
     src->fd = owned;
     src->pos = 0;
     src->physical_pos = 0;
+    src->logical_base = 0;
+    src->replay_base = 0;
     src->replay_size = 0;
     src->replay_cap = MH_STREAM_REPLAY_BYTES;
     return src;
@@ -224,13 +240,14 @@ static ma_result mh_decoder_init_fd_source(mh_fd_source* src, const ma_decoder_c
 
 static int mh_source_seek(mh_fd_source* src, ma_int64 byteOffset, int originStart) {
     if (!src || src->fd < 0) return 0;
-    ma_int64 base = originStart ? 0 : (ma_int64)src->pos;
+    ma_int64 base = originStart ? (ma_int64)src->logical_base : (ma_int64)src->pos;
     ma_int64 target64 = base + byteOffset;
     if (target64 < 0) return 0;
     ma_uint64 target = (ma_uint64)target64;
 
     if (target <= src->physical_pos) {
-        if (target > (ma_uint64)src->replay_size) return 0;
+        ma_uint64 replay_end = src->replay_base + (ma_uint64)src->replay_size;
+        if (target < src->replay_base || target > replay_end) return 0;
         src->pos = target;
         return 1;
     }
@@ -392,13 +409,62 @@ static ma_bool32 mh_drflac_stream_seek(void* pUserData, int offset, ma_dr_flac_s
 static ma_bool32 mh_drflac_stream_tell(void* pUserData, ma_int64* pCursor) {
     mh_fd_source* src = (mh_fd_source*)pUserData;
     if (!src || !pCursor) return MA_FALSE;
-    *pCursor = (ma_int64)src->pos;
+    *pCursor = (ma_int64)(src->pos - src->logical_base);
     return MA_TRUE;
 }
 
 
 static size_t mh_drmp3_stream_read(void* pUserData, void* pBufferOut, size_t bytesToRead) {
     return mh_source_read((mh_fd_source*)pUserData, pBufferOut, bytesToRead);
+}
+
+static int mh_source_locate_next_ogg_bos(mh_fd_source* src) {
+    if (!src) return 0;
+    ma_uint64 old_base = src->logical_base;
+    unsigned char scratch[4096];
+    size_t scanned = 0;
+    for (;;) {
+        if (src->replay_size >= 6) {
+            for (size_t i = 0; i + 6 <= src->replay_size; ++i) {
+                ma_uint64 absolute = src->replay_base + (ma_uint64)i;
+                if (absolute <= old_base) continue;
+                if (src->replay[i] == 'O' && src->replay[i+1] == 'g' && src->replay[i+2] == 'g' && src->replay[i+3] == 'S' &&
+                    src->replay[i+4] == 0 && (src->replay[i+5] & 0x02) != 0) {
+                    src->logical_base = absolute;
+                    src->pos = absolute;
+                    return 1;
+                }
+            }
+        }
+        if (scanned >= MH_STREAM_REPLAY_BYTES || g.decoder_thread_stop) return 0;
+        size_t got = mh_source_read(src, scratch, sizeof(scratch));
+        if (got == 0) return 0;
+        scanned += got;
+    }
+}
+
+static int mh_radio_flac_open_current_chain(void) {
+    if (!g.decoder_source) return -1;
+    if (g.radio_ogg_flac) { ma_dr_flac_close(g.radio_ogg_flac); g.radio_ogg_flac = NULL; }
+    if (g.radio_flac_resampler_init) { ma_resampler_uninit(&g.radio_flac_resampler, NULL); g.radio_flac_resampler_init = 0; }
+    g.radio_ogg_flac = ma_dr_flac_open_relaxed(mh_drflac_stream_read, mh_drflac_stream_seek, mh_drflac_stream_tell,
+                                                ma_dr_flac_container_ogg, g.decoder_source, NULL);
+    if (!g.radio_ogg_flac) return -1;
+    g.radio_flac_rate = (int)g.radio_ogg_flac->sampleRate;
+    g.radio_flac_channels = (int)g.radio_ogg_flac->channels;
+    if (g.radio_flac_rate <= 0 || g.radio_flac_channels <= 0 || g.radio_flac_channels > 8) return -1;
+    if (g.radio_flac_rate != MH_RATE) {
+        ma_resampler_config rc = ma_resampler_config_init(ma_format_f32, MH_CHANNELS, (ma_uint32)g.radio_flac_rate, MH_RATE, ma_resample_algorithm_linear);
+        if (ma_resampler_init(&rc, NULL, &g.radio_flac_resampler) != MA_SUCCESS) return -1;
+        g.radio_flac_resampler_init = 1;
+    }
+    g.decoder_eof = 0;
+    return 0;
+}
+
+static int mh_radio_flac_advance_chain(void) {
+    if (!g.decoder_source || !mh_source_locate_next_ogg_bos(g.decoder_source)) return -1;
+    return mh_radio_flac_open_current_chain();
 }
 
 static int mh_radio_flac_decode_to_ring(ma_uint32 source_frames) {
@@ -409,7 +475,11 @@ static int mh_radio_flac_decode_to_ring(ma_uint32 source_frames) {
     while (source_frames > 0 && !g.decoder_thread_stop) {
         ma_uint32 want = source_frames > MH_FILE_DECODE_CHUNK ? MH_FILE_DECODE_CHUNK : source_frames;
         ma_uint64 got = ma_dr_flac_read_pcm_frames_f32(g.radio_ogg_flac, want, raw);
-        if (got == 0) { g.decoder_eof = 1; return 0; }
+        if (got == 0) {
+            if (mh_radio_flac_advance_chain() == 0) continue;
+            g.decoder_eof = 1;
+            return 0;
+        }
         if (g.radio_flac_channels == 2) {
             memcpy(stereo, raw, (size_t)got * 2 * sizeof(float));
         } else if (g.radio_flac_channels == 1) {
