@@ -824,6 +824,9 @@ void mh_audio_stop(void) {
     pthread_mutex_unlock(&g.next_mutex);
     for (int i=0;i<10;++i) g.levels[i]=0;
     g.viz_frames[0]=0; g.viz_frames[1]=0; g.viz_ready=0;
+    /* No decoder thread is alive after mh_audio_stop(). Reset the stop flag so
+       stream decoder initialization can read from a newly opened source. */
+    g.decoder_thread_stop=0;
 }
 
 int mh_audio_start_fd(int fd, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble) {
