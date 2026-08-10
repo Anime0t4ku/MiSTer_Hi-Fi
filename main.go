@@ -2258,6 +2258,9 @@ func (p *Player) playCurrentUnlocked() error {
 func (p *Player) monitorPlayback(stop <-chan struct{}, generation uint64) {
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
+	lastRadioPosition := -1.0
+	lastRadioProgress := time.Now()
+	const radioStallTimeout = 750 * time.Millisecond
 	for {
 		select {
 		case <-stop:
@@ -2275,18 +2278,37 @@ func (p *Player) monitorPlayback(stop <-chan struct{}, generation uint64) {
 			transition := nativeAudioTakeTransition()
 			ended := nativeAudioEnded()
 			p.mu.Lock()
+			reconnectRadio := p.reconnectRadio
 			p.levels = lv
 			p.mu.Unlock()
+
+			// Some Ogg/FLAC radio servers can stop yielding decoded PCM at a
+			// track boundary without reporting a formal EOF. For radio playback,
+			// treat a frozen native playback position as an ended stream and use
+			// the same immediate restart path as the Next Track action.
+			if reconnectRadio && !ended {
+				pos := nativeAudioPosition()
+				if lastRadioPosition < 0 || pos > lastRadioPosition+0.001 {
+					lastRadioPosition = pos
+					lastRadioProgress = time.Now()
+				} else if time.Since(lastRadioProgress) >= radioStallTimeout {
+					p.opMu.Unlock()
+					p.next()
+					return
+				}
+			}
 			if transition {
 				p.handleGaplessTransitionUnlocked()
 			}
 			if ended {
-				p.mu.Lock()
-				reconnectRadio := p.reconnectRadio
-				p.mu.Unlock()
 				if reconnectRadio {
+					// Use the exact same path as pressing Next Track. A radio queue
+					// contains one station, so next() wraps to that same station and
+					// performs a complete stop/start immediately. This avoids a
+					// separate delayed reconnect state machine and matches the manual
+					// action already known to recover this stream correctly.
 					p.opMu.Unlock()
-					go p.restartRadioStream(stop, generation)
+					p.next()
 					return
 				}
 				p.advanceUnlocked(generation, stop)
