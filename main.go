@@ -2286,7 +2286,7 @@ func (p *Player) monitorPlayback(stop <-chan struct{}, generation uint64) {
 				p.mu.Unlock()
 				if reconnectRadio {
 					p.opMu.Unlock()
-					go p.reconnectRadioStream(stop, generation)
+					go p.restartRadioStream(stop, generation)
 					return
 				}
 				p.advanceUnlocked(generation, stop)
@@ -2298,9 +2298,83 @@ func (p *Player) monitorPlayback(stop <-chan struct{}, generation uint64) {
 	}
 }
 
-func (p *Player) reconnectRadioStream(stop <-chan struct{}, generation uint64) {
+func (p *Player) restartRadioStream(oldStop <-chan struct{}, oldGeneration uint64) {
 	const retryDelay = time.Second
+
+	p.opMu.Lock()
+	p.mu.Lock()
+	current := p.reconnectRadio && p.stop == oldStop && p.generation == oldGeneration && !p.stopped &&
+		p.q.Index >= 0 && p.q.Index < len(p.q.Tracks) && isHTTPURL(p.q.Tracks[p.q.Index].Path)
+	if !current {
+		p.mu.Unlock()
+		p.opMu.Unlock()
+		return
+	}
+
+	// A radio EOF starts a completely fresh playback session. Reusing the old
+	// generation/stop token can leave the reconnect tied to state from the
+	// decoder that just ended. Manual station selection already gets fresh
+	// tokens; automatic recovery should behave the same way.
+	oldCancel := p.streamCancel
+	p.streamCancel = nil
+	p.generation++
+	generation := p.generation
+	stop := make(chan struct{})
+	p.stop = stop
+	p.paused = false
+	p.basePosition = 0
+	p.levels = [10]float64{}
+	p.mu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
+	nativeAudioStop()
+	p.opMu.Unlock()
+
 	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+
+		p.opMu.Lock()
+		p.mu.Lock()
+		current = p.reconnectRadio && p.stop == stop && p.generation == generation && !p.stopped &&
+			p.q.Index >= 0 && p.q.Index < len(p.q.Tracks) && isHTTPURL(p.q.Tracks[p.q.Index].Path)
+		if !current {
+			p.mu.Unlock()
+			p.opMu.Unlock()
+			return
+		}
+		t := p.q.Tracks[p.q.Index]
+		cfg := p.cfg
+		p.mu.Unlock()
+
+		cancel, err := nativeAudioStartURL(t.Path, cfg.EQ)
+		if err == nil {
+			p.mu.Lock()
+			current = p.reconnectRadio && p.stop == stop && p.generation == generation && !p.stopped
+			if current {
+				p.streamCancel = cancel
+				p.paused = false
+				p.basePosition = 0
+			}
+			p.mu.Unlock()
+			p.opMu.Unlock()
+			if !current {
+				if cancel != nil {
+					cancel()
+				}
+				nativeAudioStop()
+				return
+			}
+			go p.monitorPlayback(stop, generation)
+			return
+		}
+		p.opMu.Unlock()
+
 		timer := time.NewTimer(retryDelay)
 		select {
 		case <-stop:
@@ -2310,50 +2384,6 @@ func (p *Player) reconnectRadioStream(stop <-chan struct{}, generation uint64) {
 			return
 		case <-timer.C:
 		}
-
-		p.opMu.Lock()
-		p.mu.Lock()
-		current := p.reconnectRadio && p.stop == stop && p.generation == generation && !p.stopped &&
-			p.q.Index >= 0 && p.q.Index < len(p.q.Tracks) && isHTTPURL(p.q.Tracks[p.q.Index].Path)
-		if !current {
-			p.mu.Unlock()
-			p.opMu.Unlock()
-			return
-		}
-		t := p.q.Tracks[p.q.Index]
-		cfg := p.cfg
-		oldCancel := p.streamCancel
-		p.streamCancel = nil
-		p.mu.Unlock()
-
-		if oldCancel != nil {
-			oldCancel()
-		}
-		nativeAudioStop()
-		cancel, err := nativeAudioStartURL(t.Path, cfg.EQ)
-		if err != nil {
-			p.opMu.Unlock()
-			continue
-		}
-
-		p.mu.Lock()
-		current = p.reconnectRadio && p.stop == stop && p.generation == generation && !p.stopped
-		if current {
-			p.streamCancel = cancel
-			p.paused = false
-			p.basePosition = 0
-		}
-		p.mu.Unlock()
-		p.opMu.Unlock()
-		if !current {
-			if cancel != nil {
-				cancel()
-			}
-			nativeAudioStop()
-			return
-		}
-		go p.monitorPlayback(stop, generation)
-		return
 	}
 }
 
