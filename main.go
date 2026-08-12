@@ -2828,16 +2828,18 @@ func clockText(cfg *Config) string {
 
 func drawClock(fb *framebuffer, cfg *Config, bg color.RGBA) (int, int, int, int) {
 	txt := clockText(cfg)
-	scale := max(1, fb.h/360)
-	margin := max(18, fb.w/64)
-	pad := max(8, scale*4)
+	// Match the menu title/version typography and keep the clock fully above
+	// the separator line drawn at y=52.
+	scale := 3
+	margin := 30
+	pad := 4
 	h := scale*7 + pad*2
 	w := tw(scale, "88:88") + pad*2
 	x := fb.w - margin - w
-	y := max(10, fb.h/54)
+	y := 18
 	fb.rect(x, y, w, h, bg)
 	if txt != "" {
-		fb.text(x+w-pad-tw(scale, txt), y+pad, scale, txt, color.RGBA{245, 245, 245, 255})
+		fb.text(x+w-pad-tw(scale, txt), 22, scale, txt, color.RGBA{245, 245, 245, 255})
 	}
 	return x, y, w, h
 }
@@ -2973,10 +2975,11 @@ func drawWebRemoteAddress(app *App) {
 		return
 	}
 	fb := app.fb
-	scale := max(1, fb.h/540)
+	// Match the title/version size and baseline while remaining centered.
+	scale := 3
 	text := app.webRemoteAddr
 	x := (fb.w - tw(scale, text)) / 2
-	fb.text(x, 28, scale, text, color.RGBA{170, 170, 175, 255})
+	fb.text(x, 22, scale, text, color.RGBA{170, 170, 175, 255})
 }
 
 func drawCircleOutline(fb *framebuffer, cx, cy, r, thick int, c color.RGBA) {
@@ -3653,24 +3656,30 @@ func drawPauseIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
 }
 
 func drawStopIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
-	s := size * 3 / 4
-	fb.rect(cx-s/2, cy-s/2, s, s, c)
+	// Keep Stop at the same visual height as the other transport controls.
+	fb.rect(cx-size/2, cy-size/2, size, size, c)
 }
 
 func drawPrevNextIcon(fb *framebuffer, cx, cy, size int, next bool, c color.RGBA) {
 	barW := max(2, size/9)
-	tri := size * 3 / 5
+	tri := size
+	barX := size/2 - barW
+	triHalfW := size * 2 / 5
+
+	// The triangle and end bar intentionally share the same full icon height.
 	if next {
-		fb.rect(cx+size/3, cy-size/2, barW, size, c)
-		for y := -tri / 2; y <= tri/2; y++ {
-			w := tri/2 - int(math.Abs(float64(y)))
-			fb.rect(cx-tri/3, cy+y, max(1, w), 2, c)
+		fb.rect(cx+barX, cy-size/2, barW, size, c)
+		for y := -tri / 2; y < tri/2; y++ {
+			w := triHalfW - (triHalfW*int(math.Abs(float64(y))))/max(1, tri/2)
+			w = max(1, w)
+			fb.rect(cx-triHalfW/2, cy+y, w, 2, c)
 		}
 	} else {
-		fb.rect(cx-size/3-barW, cy-size/2, barW, size, c)
-		for y := -tri / 2; y <= tri/2; y++ {
-			w := tri/2 - int(math.Abs(float64(y)))
-			fb.rect(cx+tri/3-w, cy+y, max(1, w), 2, c)
+		fb.rect(cx-barX-barW, cy-size/2, barW, size, c)
+		for y := -tri / 2; y < tri/2; y++ {
+			w := triHalfW - (triHalfW*int(math.Abs(float64(y))))/max(1, tri/2)
+			w = max(1, w)
+			fb.rect(cx+triHalfW/2-w, cy+y, w, 2, c)
 		}
 	}
 }
