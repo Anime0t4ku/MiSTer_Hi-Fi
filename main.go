@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.5.1"
+const version = "1.6.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -59,6 +59,8 @@ type Config struct {
 	SwapAB                bool     `json:"swap_ab"`
 	SwapXY                bool     `json:"swap_xy"`
 	CustomFont            string   `json:"custom_font"`
+	WebRemoteEnabled      bool     `json:"web_remote_enabled"`
+	WebRemotePort         int      `json:"web_remote_port"`
 }
 type EQConfig struct {
 	Enabled                            bool `json:"enabled"`
@@ -665,7 +667,7 @@ func (t *termState) restore() {
 }
 
 func defaultConfig() Config {
-	return Config{Visualizer: "bars", ConfirmOnExit: true}
+	return Config{Visualizer: "bars", ConfirmOnExit: true, WebRemoteEnabled: true, WebRemotePort: defaultWebRemotePort}
 }
 func loadConfig() Config {
 	c := defaultConfig()
@@ -696,6 +698,12 @@ func loadConfig() Config {
 	}
 	if c.Visualizer == "" {
 		c.Visualizer = "bars"
+	}
+	if _, ok := raw["web_remote_enabled"]; !ok {
+		c.WebRemoteEnabled = true
+	}
+	if c.WebRemotePort <= 0 || c.WebRemotePort > 65535 {
+		c.WebRemotePort = defaultWebRemotePort
 	}
 	saveConfig(c)
 	return c
@@ -2778,13 +2786,16 @@ type browseOrigin struct {
 }
 
 type App struct {
-	fb          *framebuffer
-	acts        <-chan action
-	external    <-chan string
-	cfg         *Config
-	player      *Player
-	origin      *browseOrigin
-	jumpSources bool
+	fb            *framebuffer
+	acts          <-chan action
+	external      <-chan string
+	cfg           *Config
+	player        *Player
+	origin        *browseOrigin
+	jumpSources   bool
+	webNowPlaying chan struct{}
+	webStop       chan struct{}
+	webRemoteAddr string
 }
 
 func appBackground(cfg *Config) color.RGBA {
@@ -2957,6 +2968,17 @@ func drawTitle(fb *framebuffer, s string) {
 	fb.rect(30, 52, fb.w-60, 2, color.RGBA{70, 70, 78, 255})
 }
 
+func drawWebRemoteAddress(app *App) {
+	if app == nil || app.webRemoteAddr == "" {
+		return
+	}
+	fb := app.fb
+	scale := max(1, fb.h/540)
+	text := app.webRemoteAddr
+	x := (fb.w - tw(scale, text)) / 2
+	fb.text(x, 28, scale, text, color.RGBA{170, 170, 175, 255})
+}
+
 func drawCircleOutline(fb *framebuffer, cx, cy, r, thick int, c color.RGBA) {
 	if r < 2 {
 		r = 2
@@ -3109,6 +3131,7 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 		barSel := hasBar && sel == len(items)
 		fb.fill(appBackground(app.cfg))
 		drawTitle(fb, title)
+		drawWebRemoteAddress(app)
 		row := max(30, fb.h/10)
 		reserve := 45
 		if hasBar {
@@ -3175,6 +3198,14 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 				playerUI(app)
 				app.jumpSources = true
 				return 0, false
+			}
+			continue
+		case <-app.webNowPlaying:
+			if app.player != nil {
+				playerUI(app)
+				if app.jumpSources {
+					return 0, false
+				}
 			}
 			continue
 		}
@@ -3935,6 +3966,19 @@ func playerUI(app *App) {
 				fb.present()
 				lastTrackKey = playerTrackKey(p)
 			}
+		case <-app.webNowPlaying:
+			if app.player != nil && app.player != p {
+				p = app.player
+				sel = 2
+				l = drawPlayerStatic(fb, p, sel, cfg)
+				drawPlayerDynamic(fb, p, l, sel, cfg)
+				fb.present()
+				lastTrackKey = playerTrackKey(p)
+				lastClock = clockText(cfg)
+			}
+		case <-app.webStop:
+			app.jumpSources = true
+			return
 		case a := <-acts:
 			redrawControls := false
 			fullRedraw := false
@@ -4100,6 +4144,7 @@ func eqUI(app *App) {
 	for {
 		fb.fill(appBackground(cfg))
 		drawTitle(fb, "EQUALIZER")
+		drawWebRemoteAddress(app)
 		vals := []string{onoff(cfg.EQ.Enabled), fmt.Sprintf("%+.1F DB", cfg.EQ.Bass), fmt.Sprintf("%+.1F DB", cfg.EQ.LowMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Mid), fmt.Sprintf("%+.1F DB", cfg.EQ.HighMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Treble), ""}
 		row := max(26, fb.h/11)
 		y := 70
@@ -4124,6 +4169,13 @@ func eqUI(app *App) {
 		case a = <-acts:
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
+				playerUI(app)
+				app.jumpSources = true
+				return
+			}
+			continue
+		case <-app.webNowPlaying:
+			if app.player != nil {
 				playerUI(app)
 				app.jumpSources = true
 				return
@@ -4191,6 +4243,7 @@ func message(app *App, title, msg string) {
 	for {
 		fb.fill(appBackground(app.cfg))
 		drawTitle(fb, title)
+		drawWebRemoteAddress(app)
 		fb.text(40, fb.h/2, 2, short(msg, max(20, fb.w/12)), color.RGBA{230, 230, 230, 255})
 		drawMessageFooter(fb)
 		drawClock(fb, app.cfg, appBackground(app.cfg))
@@ -4202,6 +4255,13 @@ func message(app *App, title, msg string) {
 		case a = <-acts:
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
+				playerUI(app)
+				app.jumpSources = true
+				return
+			}
+			continue
+		case <-app.webNowPlaying:
+			if app.player != nil {
 				playerUI(app)
 				app.jumpSources = true
 				return
@@ -4393,6 +4453,7 @@ func confirmExitUI(app *App) bool {
 		bg := appBackground(app.cfg)
 		fb.fill(bg)
 		drawTitle(fb, "EXIT MISTER HI-FI?")
+		drawWebRemoteAddress(app)
 		scale := max(1, fb.h/180)
 		msg := "A  EXIT     B  CANCEL"
 		x := (fb.w - tw(scale, msg)) / 2
@@ -4414,6 +4475,11 @@ func confirmExitUI(app *App) bool {
 				playerUI(app)
 				return false
 			}
+		case <-app.webNowPlaying:
+			if app.player != nil {
+				playerUI(app)
+			}
+			return false
 		}
 	}
 }
@@ -4470,6 +4536,7 @@ func settingsUI(app *App) {
 		}
 		fb.fill(appBackground(cfg))
 		drawTitle(fb, "SETTINGS")
+		drawWebRemoteAddress(app)
 		y0 := max(66, fb.h/15)
 		bottomReserve := max(82, fb.h/11)
 		row := (fb.h - y0 - bottomReserve) / len(labels)
@@ -4545,6 +4612,13 @@ func settingsUI(app *App) {
 		case a = <-acts:
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
+				playerUI(app)
+				app.jumpSources = true
+				return
+			}
+			continue
+		case <-app.webNowPlaying:
+			if app.player != nil {
 				playerUI(app)
 				app.jumpSources = true
 				return
@@ -4887,13 +4961,19 @@ func main() {
 	inputLoop(rawActs, done)
 	go screenSaverInputLoop(fb, rawActs, acts, done)
 	defer close(done)
-	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg}
+	webNowPlaying := make(chan struct{}, 1)
+	webStop := make(chan struct{}, 1)
+	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg, webNowPlaying: webNowPlaying, webStop: webStop}
 	defer cleanupSMBMounts()
 	defer func() {
 		if app.player != nil {
 			app.player.stopPlaybackRaw()
 		}
 	}()
+	webRemote := startWebRemote(app)
+	if webRemote != nil {
+		defer webRemote.Close()
+	}
 	if launchTarget != "" {
 		if err := app.startExternal(launchTarget); err != nil {
 			message(app, "MISTER HI-FI", strings.ToUpper(err.Error()))
