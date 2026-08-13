@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.6.0"
+const version = "1.6.1"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -1723,6 +1723,37 @@ func parseFlacPicture(t *Track, b []byte) {
 		t.Art = im
 	}
 }
+func normalizeM3UPath(raw, playlistPath string) string {
+	x := strings.TrimSpace(strings.TrimPrefix(raw, "\uFEFF"))
+	if len(x) >= 2 {
+		if (x[0] == '"' && x[len(x)-1] == '"') || (x[0] == '\'' && x[len(x)-1] == '\'') {
+			x = strings.TrimSpace(x[1 : len(x)-1])
+		}
+	}
+	if x == "" {
+		return ""
+	}
+
+	// M3U files are frequently generated on Windows, even when the playlist is
+	// later copied to MiSTer. Treat backslashes as path separators for local
+	// filesystem entries while leaving URI-style entries untouched.
+	if u, err := url.Parse(x); err == nil && u.Scheme != "" && !(len(u.Scheme) == 1 && len(x) >= 2 && x[1] == ':') {
+		if strings.EqualFold(u.Scheme, "file") {
+			x = u.Path
+		} else {
+			return x
+		}
+	} else {
+		x = strings.ReplaceAll(x, "\\", "/")
+		x = filepath.FromSlash(x)
+	}
+
+	if !filepath.IsAbs(x) {
+		x = filepath.Join(filepath.Dir(playlistPath), x)
+	}
+	return filepath.Clean(x)
+}
+
 func parseM3U(p string) []string {
 	f, e := os.Open(p)
 	if e != nil {
@@ -1732,14 +1763,16 @@ func parseM3U(p string) []string {
 	var out []string
 	s := bufio.NewScanner(f)
 	for s.Scan() {
-		x := strings.TrimSpace(s.Text())
-		if x == "" || strings.HasPrefix(x, "#") {
+		raw := strings.TrimSpace(strings.TrimPrefix(s.Text(), "\uFEFF"))
+		if raw == "" || strings.HasPrefix(raw, "#") {
 			continue
 		}
-		if !filepath.IsAbs(x) {
-			x = filepath.Join(filepath.Dir(p), x)
+		x := normalizeM3UPath(raw, p)
+		if x == "" {
+			continue
 		}
-		if supported[strings.ToLower(filepath.Ext(x))] && strings.ToLower(filepath.Ext(x)) != ".m3u" && strings.ToLower(filepath.Ext(x)) != ".m3u8" {
+		ext := strings.ToLower(filepath.Ext(x))
+		if supported[ext] && ext != ".m3u" && ext != ".m3u8" {
 			out = append(out, x)
 		}
 	}
@@ -1751,6 +1784,8 @@ func buildQueue(path string, external bool) Queue {
 	if external {
 		if st, err := os.Stat(path); err == nil && st.IsDir() {
 			ps = audioFiles(path)
+		} else if ext := strings.ToLower(filepath.Ext(path)); ext == ".m3u" || ext == ".m3u8" {
+			ps = parseM3U(path)
 		} else {
 			ps = []string{path}
 		}
