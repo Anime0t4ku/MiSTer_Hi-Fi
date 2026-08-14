@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.6.1"
+const version = "1.6.2"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -107,6 +107,8 @@ type framebuffer struct {
 	data              []byte
 	back              []byte
 	w, h, stride, bpp int
+	presentMu         sync.Mutex
+	sampleExpected    [][]byte
 }
 
 type inputEvent struct {
@@ -299,6 +301,8 @@ func (fb *framebuffer) present() {
 	if fb == nil || len(fb.back) == 0 || len(fb.data) == 0 {
 		return
 	}
+	fb.presentMu.Lock()
+	defer fb.presentMu.Unlock()
 	n := fb.stride * fb.h
 	if n > len(fb.back) {
 		n = len(fb.back)
@@ -307,6 +311,7 @@ func (fb *framebuffer) present() {
 		n = len(fb.data)
 	}
 	copy(fb.data[:n], fb.back[:n])
+	fb.captureFramebufferSamplesLocked(0, 0, fb.w, fb.h)
 }
 func (fb *framebuffer) presentRegion(x, y, w, h int) {
 	if screenSaverActive.Load() {
@@ -332,11 +337,14 @@ func (fb *framebuffer) presentRegion(x, y, w, h int) {
 	if w <= 0 || h <= 0 {
 		return
 	}
+	fb.presentMu.Lock()
+	defer fb.presentMu.Unlock()
 	n := w * fb.bpp
 	for yy := y; yy < y+h; yy++ {
 		o := yy*fb.stride + x*fb.bpp
 		copy(fb.data[o:o+n], fb.back[o:o+n])
 	}
+	fb.captureFramebufferSamplesLocked(x, y, w, h)
 }
 func customFallbackPixelHeight(s int) int {
 	if s < 1 {
@@ -347,6 +355,123 @@ func customFallbackPixelHeight(s int) int {
 		px = 1
 	}
 	return px
+}
+
+// framebufferSampleRects returns a few tiny regions spread over the screen.
+// Together they cover the header, body and footer without scanning full frames.
+func (fb *framebuffer) framebufferSampleRects() [][4]int {
+	const sampleW, sampleH = 12, 4
+	points := [][2]int{
+		{fb.w / 8, fb.h / 12},
+		{fb.w / 2, fb.h / 12},
+		{fb.w * 7 / 8, fb.h / 12},
+		{fb.w / 4, fb.h / 2},
+		{fb.w * 3 / 4, fb.h / 2},
+		{fb.w / 8, fb.h * 11 / 12},
+		{fb.w / 2, fb.h * 11 / 12},
+		{fb.w * 7 / 8, fb.h * 11 / 12},
+	}
+	out := make([][4]int, 0, len(points))
+	for _, p := range points {
+		x, y := p[0]-sampleW/2, p[1]-sampleH/2
+		if x >= 0 && y >= 0 && x+sampleW <= fb.w && y+sampleH <= fb.h {
+			out = append(out, [4]int{x, y, sampleW, sampleH})
+		}
+	}
+	return out
+}
+
+func rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh int) bool {
+	return ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by
+}
+
+// captureFramebufferSamplesLocked records only regions that were legitimately
+// presented by Hi-Fi. It must be called with presentMu held.
+func (fb *framebuffer) captureFramebufferSamplesLocked(px, py, pw, ph int) {
+	if fb == nil || len(fb.data) == 0 {
+		return
+	}
+	rects := fb.framebufferSampleRects()
+	if len(fb.sampleExpected) != len(rects) {
+		fb.sampleExpected = make([][]byte, len(rects))
+	}
+	for i, r := range rects {
+		x, y, w, h := r[0], r[1], r[2], r[3]
+		if !rectsOverlap(x, y, w, h, px, py, pw, ph) {
+			continue
+		}
+		need := w * h * fb.bpp
+		if len(fb.sampleExpected[i]) != need {
+			fb.sampleExpected[i] = make([]byte, need)
+		}
+		dst := fb.sampleExpected[i]
+		rowBytes := w * fb.bpp
+		for yy := 0; yy < h; yy++ {
+			o := (y+yy)*fb.stride + x*fb.bpp
+			copy(dst[yy*rowBytes:(yy+1)*rowBytes], fb.data[o:o+rowBytes])
+		}
+	}
+}
+
+// framebufferIntactLocked checks only the saved sample regions. Normal drawing
+// into the back buffer cannot trigger this because the expected samples change
+// only after a legitimate present/presentRegion operation.
+func (fb *framebuffer) framebufferIntactLocked() bool {
+	if fb == nil || len(fb.data) == 0 || len(fb.sampleExpected) == 0 {
+		return true
+	}
+	rects := fb.framebufferSampleRects()
+	if len(rects) != len(fb.sampleExpected) {
+		return true
+	}
+	for i, r := range rects {
+		if len(fb.sampleExpected[i]) == 0 {
+			continue
+		}
+		x, y, w, h := r[0], r[1], r[2], r[3]
+		rowBytes := w * fb.bpp
+		for yy := 0; yy < h; yy++ {
+			o := (y+yy)*fb.stride + x*fb.bpp
+			exp := fb.sampleExpected[i][yy*rowBytes : (yy+1)*rowBytes]
+			if !bytes.Equal(fb.data[o:o+rowBytes], exp) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (fb *framebuffer) restoreIfOverwritten() {
+	if fb == nil || screenSaverActive.Load() {
+		return
+	}
+	fb.presentMu.Lock()
+	defer fb.presentMu.Unlock()
+	if screenSaverActive.Load() || fb.framebufferIntactLocked() {
+		return
+	}
+	n := fb.stride * fb.h
+	if n > len(fb.back) {
+		n = len(fb.back)
+	}
+	if n > len(fb.data) {
+		n = len(fb.data)
+	}
+	copy(fb.data[:n], fb.back[:n])
+	fb.captureFramebufferSamplesLocked(0, 0, fb.w, fb.h)
+}
+
+func framebufferRecoveryLoop(fb *framebuffer, done <-chan struct{}) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-tick.C:
+			fb.restoreIfOverwritten()
+		}
+	}
 }
 
 func (fb *framebuffer) text(x, y, s int, str string, c color.RGBA) {
@@ -4999,6 +5124,7 @@ func main() {
 	swapABInput.Store(cfg.SwapAB)
 	swapXYInput.Store(cfg.SwapXY)
 	done := make(chan struct{})
+	go framebufferRecoveryLoop(fb, done)
 	rawActs := make(chan action, 8)
 	acts := make(chan action, 8)
 	screenSaverSeconds.Store(int64(cfg.ScreenSaverSeconds))
