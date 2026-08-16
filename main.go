@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.6.2"
+const version = "1.7.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -2320,6 +2320,8 @@ func (p *Player) prepareGaplessNextFile() {
 	}
 	next := p.q.Tracks[nextIndex]
 	if strings.HasPrefix(current.Path, "cdda:") || strings.HasPrefix(next.Path, "cdda:") ||
+		strings.HasPrefix(current.Path, "vcdcue:") || strings.HasPrefix(next.Path, "vcdcue:") ||
+		strings.HasPrefix(current.Path, "vcdchd:") || strings.HasPrefix(next.Path, "vcdchd:") ||
 		!gaplessTrackSupported(current) || !gaplessTrackSupported(next) {
 		p.gaplessQueuedIndex = -1
 		p.mu.Unlock()
@@ -2356,7 +2358,7 @@ func (p *Player) handleGaplessTransitionUnlocked() {
 	p.paused = false
 	p.stopped = false
 	p.mu.Unlock()
-	if !strings.HasPrefix(t.Path, "cdda:") {
+	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") {
 		p.loadCurrentMetadata(nextIndex, t)
 		p.prepareGaplessNextFile()
 	}
@@ -2390,6 +2392,8 @@ func (p *Player) playCurrentUnlocked() error {
 	var err error
 	if strings.HasPrefix(t.Path, "cdda:") {
 		err = p.playCDTrack(t, stop)
+	} else if strings.HasPrefix(t.Path, "vcdcue:") || strings.HasPrefix(t.Path, "vcdchd:") {
+		err = p.playVirtualCDTrack(t, stop)
 	} else if isHTTPURL(t.Path) {
 		var cancel func()
 		cancel, err = nativeAudioStartURL(t.Path, cfg.EQ)
@@ -2417,7 +2421,7 @@ func (p *Player) playCurrentUnlocked() error {
 		p.mu.Unlock()
 		return err
 	}
-	if !strings.HasPrefix(t.Path, "cdda:") && !isHTTPURL(t.Path) {
+	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") && !isHTTPURL(t.Path) {
 		p.prepareGaplessNextFile()
 	}
 	go p.monitorPlayback(stop, generation)
@@ -2902,7 +2906,7 @@ func (p *Player) seekBy(seconds float64) {
 	if isHTTPURL(t.Path) {
 		return
 	}
-	if !strings.HasPrefix(t.Path, "cdda:") {
+	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") {
 		_ = nativeAudioSeek(target)
 		return
 	}
@@ -2916,7 +2920,13 @@ func (p *Player) seekBy(seconds float64) {
 	p.stopped = false
 	p.basePosition = target
 	p.mu.Unlock()
-	if err := p.playCDTrack(t, stop); err != nil {
+	var err error
+	if strings.HasPrefix(t.Path, "cdda:") {
+		err = p.playCDTrack(t, stop)
+	} else {
+		err = p.playVirtualCDTrack(t, stop)
+	}
+	if err != nil {
 		p.stopAndResetUnlocked()
 		return
 	}
@@ -2956,6 +2966,7 @@ type App struct {
 	webNowPlaying chan struct{}
 	webStop       chan struct{}
 	webRemoteAddr string
+	virtualCD     *VirtualDisc
 }
 
 func appBackground(cfg *Config) color.RGBA {
@@ -5001,6 +5012,8 @@ func sourcesUI(app *App) {
 		}
 		items = append(items, "ONLINE RADIO")
 		types = append(types, "radio")
+		items = append(items, "VIRTUAL CD")
+		types = append(types, "virtualcd")
 		if len(detectOptical()) > 0 {
 			items = append(items, "PHYSICAL DISC")
 			types = append(types, "disc")
@@ -5064,6 +5077,8 @@ func sourcesUI(app *App) {
 			runBrowserSource(app, root, "smb")
 		case "radio":
 			onlineRadioUI(app)
+		case "virtualcd":
+			virtualCDUI(app)
 		case "disc":
 			physicalDisc(app)
 		case "settings":

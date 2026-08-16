@@ -2,7 +2,7 @@
 
 MiSTer Hi-Fi is a controller-first music player for MiSTer FPGA.
 
-It supports local music, USB storage, SMB shares, online radio, playlists, physical Audio CDs, album artwork, a spectrum visualizer, equalizer, OLED mode, custom fallback fonts, and direct launching through NFC using Zaparoo.
+It supports local music, USB storage, SMB shares, online radio, playlists, Physical CDs, Virtual CDs from CHD and BIN/CUE disc images, album artwork, a spectrum visualizer, equalizer, OLED mode, custom fallback fonts, and direct launching through NFC using Zaparoo.
 
 ## Installation
 
@@ -37,10 +37,27 @@ SD Card
 USB
 SMB
 Online Radio
+Virtual CD
 Physical Audio CD
 ```
 
 Music can be browsed directly from the source list.
+
+### Virtual CD
+
+**Virtual CD** lets you use CD-based game disc images already stored on the MiSTer as playable audio discs. It supports **CHD** and **BIN/CUE** images and exposes the disc's CDDA tracks while ignoring data tracks.
+
+When no image is mounted, open **Virtual CD > Select Disc** and choose a `.chd` or `.cue` file from the MiSTer SD card. Once mounted, Virtual CD provides:
+
+```text
+Play Disc
+Browse Disc
+Unmount Disc
+```
+
+**Play Disc** starts from the first audio track. **Browse Disc** opens the audio track list for individual track selection. **Unmount Disc** closes the current image and returns Virtual CD to the Select Disc state.
+
+CHD images are read directly through **libchdr** and are not extracted to temporary BIN/CUE files. BIN/CUE images are also read directly from their referenced BIN data.
 
 Physical Audio CDs open directly in the player and automatically start from the first audio track. Press **B** from the player to open the disc track list.
 
@@ -65,6 +82,7 @@ It also supports:
 M3U playlists
 M3U8 playlists
 Physical Audio CD / CDDA
+Virtual CD / CDDA (CHD and BIN/CUE)
 ```
 
 M4A files can contain either **AAC-LC** or **Apple Lossless (ALAC)** audio. Embedded MP4 metadata and cover artwork are supported.
@@ -367,7 +385,7 @@ Bitrate
 
 M4A files identify their contained codec as `AAC` or `ALAC`. ALAC also reports bit depth when available.
 
-Physical Audio CDs are shown as:
+Physical and Virtual CD audio tracks are shown as:
 
 ```text
 CDDA    16 bit    44.1 kHz    1411 kbps
@@ -544,12 +562,14 @@ MiSTer Hi-Fi is written primarily in Go, with additional native components for a
 
 The main audio path uses **miniaudio**.
 
+Virtual CD CHD playback uses **libchdr** to read CHD CD metadata and sectors directly without extracting the image.
+
 M4A/MP4 playback uses a separate **Symphonia** decoder path for AAC-LC and ALAC.
 
 Build:
 
 ```bash
-chmod +x fetch_miniaudio.sh build-mister.sh
+chmod +x fetch_miniaudio.sh fetch_libchdr.sh build-mister.sh
 ./build-mister.sh
 ```
 
@@ -559,7 +579,7 @@ The resulting MiSTer binary is placed at:
 Scripts/.config/MiSTerHiFi/mister_hifi
 ```
 
-The repository does not store `miniaudio.h`. The build process downloads the required upstream miniaudio source automatically.
+The repository does not store `miniaudio.h` or the libchdr source tree. The build process downloads the required upstream sources automatically. libchdr is pinned to the version used by `fetch_libchdr.sh` and is cross-compiled into the MiSTer ARMv7 build.
 
 Building M4A support also requires Rust/Cargo and the following Rust target:
 
@@ -578,6 +598,14 @@ MiSTer Hi-Fi uses several third-party components.
 [miniaudio](https://github.com/mackron/miniaudio) by David Reid is used for audio decoding and playback.
 
 miniaudio is available under the author's choice of **Public Domain** or the **MIT No Attribution (MIT-0) License**.
+
+### libchdr
+
+[libchdr](https://github.com/rtissera/libchdr) is used by **Virtual CD** to read MAME CHD CD images, their track metadata, and compressed CD sectors directly.
+
+libchdr is distributed under the **BSD 3-Clause License**. libchdr also includes third-party compression/decoding components which remain under their respective upstream licenses. The build uses the upstream libchdr source and bundled dependencies without relicensing them under MiSTer Hi-Fi's GPLv3 license.
+
+The libchdr source and its accompanying license files are downloaded from the upstream project by `fetch_libchdr.sh` during the build.
 
 ### Symphonia
 

@@ -34,7 +34,7 @@ jobs:
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl xz-utils zip file
+          sudo apt-get install -y curl xz-utils zip file cmake
 
       - name: Install ARM GCC 10.2 Toolchain
         run: |
@@ -55,7 +55,7 @@ jobs:
         env:
           CC: arm-none-linux-gnueabihf-gcc
         run: |
-          chmod +x fetch_miniaudio.sh build-mister.sh
+          chmod +x fetch_miniaudio.sh fetch_libchdr.sh build-mister.sh
           ./build-mister.sh
 
       - name: Verify Build Output

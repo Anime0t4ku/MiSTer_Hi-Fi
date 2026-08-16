@@ -5,3 +5,5 @@ Scripts/.config/MiSTerHiFi/mister_hifi
 Scripts/.config/MiSTerHiFi/config.json
 .DS_Store
 stb_vorbis.h
+
+third_party/libchdr/

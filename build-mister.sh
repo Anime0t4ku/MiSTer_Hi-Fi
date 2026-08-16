@@ -23,6 +23,8 @@ command -v go >/dev/null 2>&1 || {
     exit 1
 }
 
+./fetch_libchdr.sh
+
 mkdir -p Scripts/.config/MiSTerHiFi
 cp radio.example.json Scripts/.config/MiSTerHiFi/radio.example.json
 
