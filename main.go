@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.7.0"
+const version = "1.8.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -5106,8 +5106,9 @@ func main() {
 		}
 		return
 	}
+	launchPhysicalCD := len(os.Args) > 1 && os.Args[1] == "--physical-cd"
 	var launchTarget string
-	if len(os.Args) > 1 {
+	if len(os.Args) > 1 && !launchPhysicalCD {
 		launchTarget = externalArg(os.Args[1:])
 		if launchTarget != "" && sendExternal(launchTarget) == nil {
 			return
@@ -5159,7 +5160,9 @@ func main() {
 	if webRemote != nil {
 		defer webRemote.Close()
 	}
-	if launchTarget != "" {
+	if launchPhysicalCD {
+		physicalDisc(app)
+	} else if launchTarget != "" {
 		if err := app.startExternal(launchTarget); err != nil {
 			message(app, "MISTER HI-FI", strings.ToUpper(err.Error()))
 		} else {

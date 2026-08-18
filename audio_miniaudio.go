@@ -211,20 +211,47 @@ func radioEncodingHint(probe []byte, contentType, rawURL string) int {
 }
 
 func looksLikeADTS(b []byte) bool {
+	// A single 0xFFFx-looking sync word is not enough to identify AAC. Those
+	// byte patterns can occur naturally inside MP3/compressed payload data and
+	// caused intermittent false "AAC/AAC+ not supported" errors depending on
+	// where the initial HTTP probe happened to begin. Require two structurally
+	// valid consecutive ADTS frames instead.
 	for i := 0; i+7 <= len(b); i++ {
-		if b[i] != 0xff || (b[i+1]&0xf6) != 0xf0 {
+		frameLength, ok := adtsFrameLength(b[i:])
+		if !ok {
 			continue
 		}
-		sampleRateIndex := (b[i+2] >> 2) & 0x0f
-		if sampleRateIndex == 0x0f {
+		next := i + frameLength
+		if next+7 > len(b) {
 			continue
 		}
-		frameLength := int(b[i+3]&0x03)<<11 | int(b[i+4])<<3 | int((b[i+5]>>5)&0x07)
-		if frameLength >= 7 {
+		if _, ok := adtsFrameLength(b[next:]); ok {
 			return true
 		}
 	}
 	return false
+}
+
+func adtsFrameLength(b []byte) (int, bool) {
+	if len(b) < 7 || b[0] != 0xff || (b[1]&0xf6) != 0xf0 {
+		return 0, false
+	}
+
+	// Layer must be 00 for ADTS and the sampling-frequency index 0x0f is
+	// reserved/invalid in an ADTS header.
+	if b[1]&0x06 != 0 || ((b[2]>>2)&0x0f) == 0x0f {
+		return 0, false
+	}
+
+	frameLength := int(b[3]&0x03)<<11 | int(b[4])<<3 | int((b[5]>>5)&0x07)
+	headerLength := 7
+	if b[1]&0x01 == 0 { // CRC present.
+		headerLength = 9
+	}
+	if frameLength < headerLength {
+		return 0, false
+	}
+	return frameLength, true
 }
 
 func nativeAudioStartPCM(eq EQConfig) error {
