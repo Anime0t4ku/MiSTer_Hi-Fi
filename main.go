@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.8.0"
+const version = "1.9.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -637,9 +637,10 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 		if e != nil {
 			continue
 		}
+		misterMap := loadMisterControllerMap(p)
 		const eviocgrab = 0x40044590
 		_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(eviocgrab), uintptr(1))
-		go func(f *os.File) {
+		go func(f *os.File, misterMap *misterControllerMap) {
 			defer func() {
 				_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(eviocgrab), uintptr(0))
 				f.Close()
@@ -656,6 +657,14 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 				if binary.Read(f, binary.LittleEndian, &ev) != nil {
 					return
 				}
+
+				if misterMap != nil {
+					if a, handled, face := misterMap.process(f, ev); handled {
+						emit(a, face)
+						continue
+					}
+				}
+
 				a := actNone
 				face := false
 				if ev.Type == evKey {
@@ -763,7 +772,7 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 				}
 				emit(a, face)
 			}
-		}(f)
+		}(f, misterMap)
 	}
 }
 

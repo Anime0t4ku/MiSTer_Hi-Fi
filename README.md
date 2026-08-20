@@ -289,6 +289,8 @@ The application does not restart. The current queue is replaced and the new trac
 
 ### Controller
 
+MiSTer Hi-Fi uses the system-wide MiSTer controller mapping when one is available, so controllers follow the layout configured through MiSTer rather than relying on their raw Linux button numbers. If no MiSTer map exists for a controller, the built-in direct input mapping remains available as a fallback.
+
 ```text
 D-Pad    Navigate
 A        Select
@@ -506,13 +508,13 @@ Gapless playback is experimental and disabled by default.
 
 ### Swap A/B
 
-Swaps the physical behavior of the A and B buttons without changing their on-screen labels.
+Swaps the logical MiSTer A and B behavior after the system-wide controller mapping is applied, without changing the on-screen labels.
 
 ### Swap X/Y
 
-Swaps the physical behavior of the X and Y buttons without changing their on-screen labels.
+Swaps the logical MiSTer X and Y behavior after the system-wide controller mapping is applied, without changing the on-screen labels.
 
-These options make it possible to use Nintendo-, Xbox-, or PlayStation-style controller layouts while keeping the MiSTer Hi-Fi interface consistent.
+These remain optional preference overrides. Controller compatibility itself comes from MiSTer's mapping; the swaps only change the final Hi-Fi button behavior.
 
 ### Custom Fallback Font
 
