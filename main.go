@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.10.0"
+const version = "1.10.1"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -103,8 +103,26 @@ type fbVar struct {
 	RedOffset, RedLength, RedMsb, GreenOffset, GreenLength, GreenMsb, BlueOffset, BlueLength, BlueMsb, TranspOffset, TranspLength, TranspMsb, Nonstd, Activate, Height, Width, AccelFlags, Pixclock, LeftMargin, RightMargin, UpperMargin, LowerMargin, HsyncLen, VsyncLen, Sync, Vmode, Rotate, Colorspace uint32
 	Reserved                                                                                                                                                                                                                                                                                                [4]uint32
 }
+type fbFix struct {
+	ID           [16]byte
+	SmemStart    uintptr
+	SmemLen      uint32
+	Type         uint32
+	TypeAux      uint32
+	Visual       uint32
+	Xpanstep     uint16
+	Ypanstep     uint16
+	Ywrapstep    uint16
+	LineLength   uint32
+	MmioStart    uintptr
+	MmioLen      uint32
+	Accel        uint32
+	Capabilities uint16
+	Reserved     [2]uint16
+}
 type framebuffer struct {
 	f                 *os.File
+	mapped            []byte
 	data              []byte
 	back              []byte
 	w, h, stride, bpp int
@@ -208,22 +226,68 @@ func openFB() (*framebuffer, error) {
 		f.Close()
 		return nil, fmt.Errorf("unsupported framebuffer depth")
 	}
-	stride := int(v.XresVirtual) * bpp
-	data, e := syscall.Mmap(int(f.Fd()), 0, stride*int(v.YresVirtual), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	var fixed fbFix
+	_, _, er = syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), 0x4602, uintptr(unsafe.Pointer(&fixed)))
+	if er != 0 {
+		f.Close()
+		return nil, er
+	}
+	stride := int(fixed.LineLength)
+	if stride == 0 {
+		stride = int(v.XresVirtual) * bpp
+	}
+	if stride < int(v.Xres)*bpp || v.Yres == 0 || v.YresVirtual == 0 {
+		f.Close()
+		return nil, fmt.Errorf("invalid framebuffer geometry")
+	}
+	mapLen64 := uint64(stride) * uint64(v.YresVirtual)
+	backLen64 := uint64(stride) * uint64(v.Yres)
+	maxInt := uint64(^uint(0) >> 1)
+	if mapLen64 == 0 || mapLen64 > maxInt || backLen64 > maxInt || (fixed.SmemLen != 0 && mapLen64 > uint64(fixed.SmemLen)) {
+		f.Close()
+		return nil, fmt.Errorf("invalid framebuffer memory size")
+	}
+	mapLen := int(mapLen64)
+	mapped, e := syscall.Mmap(int(f.Fd()), 0, mapLen, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	data := mapped
+	if e == syscall.ENODEV {
+		if fixed.SmemStart == 0 || fixed.SmemLen == 0 {
+			f.Close()
+			return nil, fmt.Errorf("framebuffer mmap unavailable and no physical framebuffer range was reported")
+		}
+		pageSize := syscall.Getpagesize()
+		physStart := uint64(fixed.SmemStart)
+		pageBase := physStart &^ uint64(pageSize-1)
+		delta := int(physStart - pageBase)
+		if mapLen > int(^uint(0)>>1)-delta {
+			f.Close()
+			return nil, fmt.Errorf("invalid physical framebuffer mapping size")
+		}
+		memFD, openErr := syscall.Open("/dev/mem", syscall.O_RDWR|syscall.O_SYNC|syscall.O_CLOEXEC, 0)
+		if openErr != nil {
+			f.Close()
+			return nil, fmt.Errorf("open /dev/mem framebuffer fallback: %w", openErr)
+		}
+		mapped, e = syscall.Mmap(memFD, int64(pageBase), mapLen+delta, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		_ = syscall.Close(memFD)
+		if e == nil {
+			data = mapped[delta : delta+mapLen]
+		}
+	}
 	if e != nil {
 		f.Close()
 		return nil, e
 	}
-	back := make([]byte, stride*int(v.Yres))
+	back := make([]byte, int(backLen64))
 	copy(back, data[:len(back)])
-	return &framebuffer{f: f, data: data, back: back, w: int(v.Xres), h: int(v.Yres), stride: stride, bpp: bpp}, nil
+	return &framebuffer{f: f, mapped: mapped, data: data, back: back, w: int(v.Xres), h: int(v.Yres), stride: stride, bpp: bpp}, nil
 }
 func (fb *framebuffer) close() {
 	if fb == nil {
 		return
 	}
-	if fb.data != nil {
-		_ = syscall.Munmap(fb.data)
+	if fb.mapped != nil {
+		_ = syscall.Munmap(fb.mapped)
 	}
 	if fb.f != nil {
 		_ = fb.f.Close()
