@@ -11,6 +11,7 @@ int mh_audio_take_transition(void);
 int mh_audio_write_pcm(const void* data, size_t bytes);
 void mh_audio_finish_pcm(void);
 void mh_audio_pause(int paused);
+void mh_audio_set_volume(int volume, int muted);
 void mh_audio_set_eq(int enabled, float bass, float lowmid, float mid, float highmid, float treble);
 void mh_audio_stop(void);
 double mh_audio_position(void);

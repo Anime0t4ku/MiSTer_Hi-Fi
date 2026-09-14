@@ -98,6 +98,8 @@ typedef struct {
 } mh_audio_state;
 
 static mh_audio_state g = { .next_mutex = PTHREAD_MUTEX_INITIALIZER, .next_fd = -1 };
+static float g_master_volume = 1.0f;
+static int g_master_muted = 0;
 static pthread_mutex_t g_pcm_writer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pcm_writer_cond = PTHREAD_COND_INITIALIZER;
 static int g_pcm_writer_active = 0;
@@ -795,8 +797,17 @@ static int mh_start_device(void) {
     c.periodSizeInMilliseconds=20;
     if (ma_device_init(NULL,&c,&g.device)!=MA_SUCCESS) { mh_seterr("unable to open MiSTer audio output"); return -1; }
     g.device_init=1;
+    ma_device_set_master_volume(&g.device, g_master_muted ? 0.0f : g_master_volume);
     if (ma_device_start(&g.device)!=MA_SUCCESS) { mh_seterr("unable to start MiSTer audio output"); ma_device_uninit(&g.device); g.device_init=0; return -1; }
     return 0;
+}
+
+void mh_audio_set_volume(int volume, int muted) {
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    g_master_volume = (float)volume / 100.0f;
+    g_master_muted = muted ? 1 : 0;
+    if (g.device_init) ma_device_set_master_volume(&g.device, g_master_muted ? 0.0f : g_master_volume);
 }
 
 void mh_audio_stop(void) {

@@ -318,6 +318,20 @@ func nativeAudioStop() {
 	C.mh_audio_stop()
 }
 
+func nativeAudioSetVolume(volume int, muted bool) {
+	if volume < 0 {
+		volume = 0
+	}
+	if volume > 100 {
+		volume = 100
+	}
+	m := C.int(0)
+	if muted {
+		m = 1
+	}
+	C.mh_audio_set_volume(C.int(volume), m)
+}
+
 func nativeAudioSetEQ(eq EQConfig) {
 	enabled := C.int(0)
 	if eq.Enabled {

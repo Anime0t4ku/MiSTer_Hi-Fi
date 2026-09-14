@@ -23,6 +23,7 @@ func nativeAudioFinishPCM()          {}
 func nativeAudioStop()               {}
 func nativeAudioPause(bool)          {}
 func nativeAudioSetEQ(EQConfig)      {}
+func nativeAudioSetVolume(int, bool) {}
 func nativeAudioPosition() float64   { return 0 }
 func nativeAudioDuration() float64   { return 0 }
 func nativeAudioSeek(float64) error  { return nil }

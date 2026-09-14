@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.10.1"
+const version = "1.11.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -52,6 +52,9 @@ type Config struct {
 	RememberShuffleLoop   bool         `json:"remember_shuffle_loop"`
 	SavedShuffle          bool         `json:"saved_shuffle"`
 	SavedLoop             bool         `json:"saved_loop"`
+	SavedLoopOne          bool         `json:"saved_loop_one"`
+	Volume                int          `json:"volume"`
+	Muted                 bool         `json:"muted"`
 	ShowClock             bool         `json:"show_clock"`
 	ConfirmOnExit         bool         `json:"confirm_on_exit"`
 	ScreenSaverSeconds    int          `json:"screensaver_seconds"`
@@ -91,11 +94,11 @@ type Track struct {
 	Art                           image.Image
 }
 type Queue struct {
-	Tracks          []Track
-	Index           int
-	Repeat, Shuffle bool
-	DirFD           int
-	UseDirFD        bool
+	Tracks                     []Track
+	Index                      int
+	Repeat, RepeatOne, Shuffle bool
+	DirFD                      int
+	UseDirFD                   bool
 }
 
 type fbVar struct {
@@ -866,7 +869,7 @@ func (t *termState) restore() {
 }
 
 func defaultConfig() Config {
-	return Config{Visualizer: "bars", ConfirmOnExit: true, WebRemoteEnabled: true, WebRemotePort: defaultWebRemotePort}
+	return Config{Visualizer: "bars", ConfirmOnExit: true, WebRemoteEnabled: true, WebRemotePort: defaultWebRemotePort, Volume: 100}
 }
 func loadConfig() Config {
 	c := defaultConfig()
@@ -903,6 +906,15 @@ func loadConfig() Config {
 	}
 	if c.WebRemotePort <= 0 || c.WebRemotePort > 65535 {
 		c.WebRemotePort = defaultWebRemotePort
+	}
+	if _, ok := raw["volume"]; !ok {
+		c.Volume = 100
+	}
+	if c.Volume < 0 {
+		c.Volume = 0
+	}
+	if c.Volume > 100 {
+		c.Volume = 100
 	}
 	saveConfig(c)
 	return c
@@ -2394,7 +2406,7 @@ func (p *Player) nextQueueIndexLocked(from int) int {
 	if len(p.q.Tracks) == 0 || from < 0 || from >= len(p.q.Tracks) {
 		return -1
 	}
-	if p.q.Repeat {
+	if p.q.Repeat && p.q.RepeatOne {
 		return from
 	}
 	if p.q.Shuffle {
@@ -2402,6 +2414,9 @@ func (p *Player) nextQueueIndexLocked(from int) int {
 	}
 	if from+1 < len(p.q.Tracks) {
 		return from + 1
+	}
+	if p.q.Repeat {
+		return 0
 	}
 	return -1
 }
@@ -2890,7 +2905,7 @@ func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
 		p.mu.Unlock()
 		return
 	}
-	if p.q.Repeat {
+	if p.q.Repeat && p.q.RepeatOne {
 	} else if p.q.Shuffle && len(p.q.Tracks) > 1 {
 		n := len(p.q.Tracks)
 		next := int(time.Now().UnixNano() % int64(n-1))
@@ -2900,6 +2915,8 @@ func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
 		p.q.Index = next
 	} else if p.q.Index+1 < len(p.q.Tracks) {
 		p.q.Index++
+	} else if p.q.Repeat {
+		p.q.Index = 0
 	} else {
 		p.stop = nil
 		p.generation++
@@ -3073,6 +3090,7 @@ type App struct {
 	jumpSources   bool
 	webNowPlaying chan struct{}
 	webStop       chan struct{}
+	playerRefresh chan struct{}
 	webRemoteAddr string
 	virtualCD     *VirtualDisc
 }
@@ -3143,6 +3161,7 @@ func (a *App) startQueue(q Queue, origin *browseOrigin) error {
 	if a.cfg.RememberShuffleLoop {
 		q.Shuffle = a.cfg.SavedShuffle
 		q.Repeat = a.cfg.SavedLoop
+		q.RepeatOne = a.cfg.SavedLoop && a.cfg.SavedLoopOne
 	}
 	if a.player != nil {
 		old := a.player
@@ -3153,6 +3172,7 @@ func (a *App) startQueue(q Queue, origin *browseOrigin) error {
 	}
 	reconnectRadio := origin != nil && origin.Kind == "radio"
 	p := newPlayer(q, *a.cfg, reconnectRadio)
+	nativeAudioSetVolume(a.cfg.Volume, a.cfg.Muted)
 	if err := p.playCurrent(); err != nil {
 		closeQueueDirFD(&q)
 		return err
@@ -3196,6 +3216,97 @@ func (a *App) nowPlayingText() string {
 	return prefix + ": " + name
 }
 
+func (a *App) cycleRepeat() {
+	if a.player == nil {
+		return
+	}
+	a.player.mu.Lock()
+	if !a.player.q.Repeat {
+		a.player.q.Repeat = true
+		a.player.q.RepeatOne = false
+	} else if !a.player.q.RepeatOne {
+		a.player.q.RepeatOne = true
+	} else {
+		a.player.q.Repeat = false
+		a.player.q.RepeatOne = false
+	}
+	rep, one := a.player.q.Repeat, a.player.q.RepeatOne
+	a.player.mu.Unlock()
+	if a.cfg.RememberShuffleLoop {
+		a.cfg.SavedLoop = rep
+		a.cfg.SavedLoopOne = one
+		saveConfig(*a.cfg)
+	}
+}
+
+func (a *App) requestPlayerRefresh() {
+	if a == nil || a.playerRefresh == nil {
+		return
+	}
+	select {
+	case a.playerRefresh <- struct{}{}:
+	default:
+	}
+}
+
+func (a *App) applyVolume(v int, persist bool) {
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	a.cfg.Volume = v
+	if a.player != nil {
+		a.player.mu.Lock()
+		a.player.cfg.Volume = v
+		a.player.mu.Unlock()
+	}
+	// Apply to the active miniaudio device immediately. Web slider drags use
+	// persist=false so rapid intermediate values never wait on config I/O.
+	nativeAudioSetVolume(v, a.cfg.Muted)
+	if persist {
+		saveConfig(*a.cfg)
+	}
+}
+
+func (a *App) setVolume(v int) {
+	a.applyVolume(v, true)
+}
+
+func (a *App) setVolumeTransient(v int) {
+	a.applyVolume(v, false)
+}
+
+func (a *App) stepVolume(dir int) {
+	v := a.cfg.Volume
+	if dir > 0 {
+		if v >= 100 {
+			v = 100
+		} else {
+			v = ((v / 5) + 1) * 5
+		}
+	} else if dir < 0 {
+		if v <= 0 {
+			v = 0
+		} else {
+			v = ((v - 1) / 5) * 5
+		}
+	}
+	a.setVolume(v)
+}
+
+func (a *App) toggleMute() {
+	a.cfg.Muted = !a.cfg.Muted
+	if a.player != nil {
+		a.player.mu.Lock()
+		a.player.cfg.Muted = a.cfg.Muted
+		a.player.mu.Unlock()
+	}
+	nativeAudioSetVolume(a.cfg.Volume, a.cfg.Muted)
+	saveConfig(*a.cfg)
+}
+
 func (a *App) handlePlaybackShortcut(act action) bool {
 	if a.player == nil {
 		return false
@@ -3230,14 +3341,7 @@ func (a *App) handlePlaybackShortcut(act action) bool {
 		}
 		return true
 	case actLoop:
-		a.player.mu.Lock()
-		a.player.q.Repeat = !a.player.q.Repeat
-		loop := a.player.q.Repeat
-		a.player.mu.Unlock()
-		if a.cfg.RememberShuffleLoop {
-			a.cfg.SavedLoop = loop
-			saveConfig(*a.cfg)
-		}
+		a.cycleRepeat()
 		return true
 	}
 	return false
@@ -3880,13 +3984,13 @@ func makePlayerLayout(fb *framebuffer, t Track, cfg *Config) playerLayout {
 	return playerLayout{margin: margin, top: top, artSize: artSize, rightX: rightX, rightW: rightW, vizY: vizY, vizH: vizH, timeY: timeY, barY: barY, barH: barH, ctrlY: ctrlY, scale: scale}
 }
 
-func playerSnapshot(p *Player) (Track, [10]float64, int, int, bool, bool, bool, bool) {
+func playerSnapshot(p *Player) (Track, [10]float64, int, int, bool, bool, bool, bool, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.q.Tracks) == 0 || p.q.Index < 0 || p.q.Index >= len(p.q.Tracks) {
-		return Track{}, [10]float64{}, 0, 0, false, false, false, true
+		return Track{}, [10]float64{}, 0, 0, false, false, false, false, true
 	}
-	return p.q.Tracks[p.q.Index], p.levels, p.q.Index, len(p.q.Tracks), p.paused, p.q.Repeat, p.q.Shuffle, p.stopped
+	return p.q.Tracks[p.q.Index], p.levels, p.q.Index, len(p.q.Tracks), p.paused, p.q.Repeat, p.q.RepeatOne, p.q.Shuffle, p.stopped
 }
 
 func drawLine(fb *framebuffer, x0, y0, x1, y1, thick int, c color.RGBA) {
@@ -3999,6 +4103,26 @@ func drawRepeatIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
 	drawLine(fb, left, cy, left+size/8, top, t, c)
 }
 
+func drawVolumeIcon(fb *framebuffer, cx, cy, size int, plus, mute bool, c color.RGBA) {
+	u := max(1, size/12)
+	bodyW := size / 4
+	bodyH := size / 3
+	fb.rect(cx-size/2, cy-bodyH/2, bodyW, bodyH, c)
+	drawLine(fb, cx-size/4, cy-bodyH/2, cx, cy-size/3, u, c)
+	drawLine(fb, cx, cy-size/3, cx, cy+size/3, u, c)
+	drawLine(fb, cx, cy+size/3, cx-size/4, cy+bodyH/2, u, c)
+	if mute {
+		drawLine(fb, cx+size/6, cy-size/5, cx+size/2, cy+size/5, u, c)
+		drawLine(fb, cx+size/2, cy-size/5, cx+size/6, cy+size/5, u, c)
+		return
+	}
+	x := cx + size/3
+	drawLine(fb, x-size/8, cy, x+size/8, cy, u, c)
+	if plus {
+		drawLine(fb, x, cy-size/8, x, cy+size/8, u, c)
+	}
+}
+
 func drawEQIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
 	t := max(2, size/12)
 	gap := size / 3
@@ -4068,7 +4192,7 @@ func drawInfoBadges(fb *framebuffer, x, y, maxW, lineScale int, t Track, cfg *Co
 func drawPlayerStatic(fb *framebuffer, p *Player, sel int, cfg *Config) playerLayout {
 	bg := playerBackground(cfg)
 	fb.fill(bg)
-	t, _, qidx, qlen, paused, rep, shuf, stopped := playerSnapshot(p)
+	t, _, qidx, qlen, paused, rep, repOne, shuf, stopped := playerSnapshot(p)
 	if qlen == 0 {
 		return playerLayout{}
 	}
@@ -4103,20 +4227,22 @@ func drawPlayerStatic(fb *framebuffer, p *Player, sel int, cfg *Config) playerLa
 	fb.text(l.rightX, metaY, bodyScale, trackText, trackColor)
 	badgeX := l.rightX + tw(bodyScale, trackText) + scaledPx(l.scale, 18)
 	drawInfoBadges(fb, badgeX, metaY, l.rightX+l.rightW, bodyScale, t, cfg)
-	drawPlayerControls(fb, p, sel, l, paused, rep, shuf, stopped, qidx, qlen, cfg)
+	drawPlayerControls(fb, p, sel, l, paused, rep, repOne, shuf, stopped, qidx, qlen, cfg)
 	drawClock(fb, cfg, bg)
 	return l
 }
 
-func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, paused, rep, shuf, stopped bool, qidx, qlen int, cfg *Config) {
+func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, paused, rep, repOne, shuf, stopped bool, qidx, qlen int, cfg *Config) {
 	bg := playerBackground(cfg)
-	ctrlTop := l.ctrlY - scaledPx(l.scale, 22)
+	ctrlTop := l.ctrlY - scaledPx(l.scale, 94)
 	ctrlH := fb.h - ctrlTop - scaledPx(l.scale, 55)
 	ctrlX := l.margin
 	ctrlW := fb.w - l.margin*2
 	if ctrlH > 0 {
 		fb.rect(ctrlX, ctrlTop, ctrlW, ctrlH, bg)
 	}
+
+	// Keep transport/toggle actions in a clean seven-item bottom row.
 	count := 7
 	cellW := ctrlW / count
 	boxH := scaledPx(l.scale, 76)
@@ -4152,6 +4278,9 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 			}
 		case 5:
 			drawRepeatIcon(fb, cx, cy, iconSize, c)
+			if repOne {
+				fb.text(cx-scaledPx(l.scale, 4), cy-scaledPx(l.scale, 7), scaledFont(l.scale, 2), "1", c)
+			}
 			if rep {
 				fb.rect(x+cellW/4, l.ctrlY+boxH-scaledPx(l.scale, 4), cellW/2, scaledPx(l.scale, 3), c)
 			}
@@ -4160,6 +4289,37 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 		}
 	}
 
+	// Volume gets its own compact strip above the transport row. The percentage
+	// has a dedicated fixed-width slot, so the +/- buttons can never overlap it.
+	volY := l.ctrlY - scaledPx(l.scale, 72)
+	volIcon := scaledPx(l.scale, 30)
+	volButtonW := scaledPx(l.scale, 70)
+	volPctW := scaledPx(l.scale, 94)
+	volGap := scaledPx(l.scale, 12)
+	volTotalW := volButtonW*3 + volPctW + volGap*3
+	volX := ctrlX + (ctrlW-volTotalW)/2
+	volH := scaledPx(l.scale, 54)
+	volC := color.RGBA{225, 225, 230, 255}
+
+	minusX := volX
+	pctX := minusX + volButtonW + volGap
+	plusX := pctX + volPctW + volGap
+	muteX := plusX + volButtonW + volGap
+	for _, b := range []struct{ sel, x int }{{8, minusX}, {9, plusX}, {10, muteX}} {
+		if sel == b.sel {
+			fb.border(b.x, volY, volButtonW, volH, scaledPx(l.scale, 2), color.RGBA{255, 255, 255, 255})
+		}
+	}
+	cy := volY + volH/2
+	drawVolumeIcon(fb, minusX+volButtonW/2, cy, volIcon, false, false, volC)
+	drawVolumeIcon(fb, plusX+volButtonW/2, cy, volIcon, true, false, volC)
+	drawVolumeIcon(fb, muteX+volButtonW/2, cy, volIcon, false, true, volC)
+	if cfg.Muted {
+		fb.rect(muteX+volButtonW/4, volY+volH-scaledPx(l.scale, 4), volButtonW/2, scaledPx(l.scale, 3), volC)
+	}
+	volText := fmt.Sprintf("%d%%", cfg.Volume)
+	volScale := scaledFont(l.scale, 3)
+	fb.text(pctX+(volPctW-tw(volScale, volText))/2, cy-scaledPx(l.scale, 9), volScale, volText, color.RGBA{190, 190, 195, 255})
 }
 
 func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg *Config) {
@@ -4167,7 +4327,7 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 		return
 	}
 	bg := playerBackground(cfg)
-	_, lv, _, _, paused, _, _, stopped := playerSnapshot(p)
+	_, lv, _, _, paused, _, _, _, stopped := playerSnapshot(p)
 	vizPad := scaledPx(l.scale, 2)
 	fb.rect(l.rightX-vizPad, l.vizY-vizPad, l.rightW+vizPad*2, l.vizH+vizPad*2, bg)
 	barGap := scaledPx(l.scale, 12)
@@ -4222,9 +4382,9 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 }
 
 func playerTrackKey(p *Player) string {
-	t, _, idx, _, paused, rep, shuf, stopped := playerSnapshot(p)
-	return fmt.Sprintf("%d|%s|%s|%s|%s|%d|%d|%d|%.3f|%t|%t|%t|%t",
-		idx, t.Title, t.Artist, t.Album, t.MediaFormat, t.BitDepth, t.SampleRate, t.BitRate, t.Duration, t.Art != nil, paused, rep || shuf, stopped)
+	t, _, idx, _, paused, rep, repOne, shuf, stopped := playerSnapshot(p)
+	return fmt.Sprintf("%d|%s|%s|%s|%s|%d|%d|%d|%.3f|%t|%t|%t|%t|%t",
+		idx, t.Title, t.Artist, t.Album, t.MediaFormat, t.BitDepth, t.SampleRate, t.BitRate, t.Duration, t.Art != nil, paused, rep, repOne || shuf, stopped)
 }
 
 func playerUI(app *App) {
@@ -4267,6 +4427,11 @@ func playerUI(app *App) {
 		case <-app.webStop:
 			app.jumpSources = true
 			return
+		case <-app.playerRefresh:
+			_, _, qidx, qlen, paused, rep, repOne, shuf, stopped := playerSnapshot(p)
+			drawPlayerControls(fb, p, sel, l, paused, rep, repOne, shuf, stopped, qidx, qlen, cfg)
+			ctrlTop := l.ctrlY - scaledPx(l.scale, 94)
+			fb.presentRegion(l.margin, ctrlTop, fb.w-l.margin*2, fb.h-ctrlTop)
 		case a := <-acts:
 			redrawControls := false
 			fullRedraw := false
@@ -4274,26 +4439,46 @@ func playerUI(app *App) {
 			case actWake:
 				fullRedraw = true
 			case actUp:
-				if sel != 0 {
+				switch {
+				case sel >= 1 && sel <= 2:
+					sel = 8
+				case sel >= 3 && sel <= 5:
+					sel = 9
+				case sel >= 6 && sel <= 7:
+					sel = 10
+				case sel >= 8 && sel <= 10:
 					sel = 0
-					redrawControls = true
 				}
+				redrawControls = true
 			case actDown:
-				if sel == 0 {
+				switch {
+				case sel == 0:
+					sel = 9
+				case sel == 8:
 					sel = 2
-					redrawControls = true
+				case sel == 9:
+					sel = 4
+				case sel == 10:
+					sel = 6
 				}
+				redrawControls = true
 			case actLeft:
 				if sel == 0 {
 					p.seekBy(-10)
-				} else if sel > 1 {
+				} else if sel >= 2 && sel <= 7 {
+					sel--
+					redrawControls = true
+				} else if sel >= 9 && sel <= 10 {
 					sel--
 					redrawControls = true
 				}
 			case actRight:
 				if sel == 0 {
 					p.seekBy(10)
-				} else if sel < 7 {
+				} else if sel >= 1 && sel < 7 {
+					sel++
+					redrawControls = true
+				} else if sel >= 8 && sel < 10 {
 					sel++
 					redrawControls = true
 				}
@@ -4320,7 +4505,7 @@ func playerUI(app *App) {
 				sel = 1
 				redrawControls = true
 			case actLast:
-				sel = 7
+				sel = 10
 				redrawControls = true
 			case actStop:
 				external := app.origin == nil
@@ -4368,14 +4553,7 @@ func playerUI(app *App) {
 					}
 					redrawControls = true
 				case 6:
-					p.mu.Lock()
-					p.q.Repeat = !p.q.Repeat
-					loop := p.q.Repeat
-					p.mu.Unlock()
-					if cfg.RememberShuffleLoop {
-						cfg.SavedLoop = loop
-						saveConfig(*cfg)
-					}
+					app.cycleRepeat()
 					redrawControls = true
 				case 7:
 					eqUI(app)
@@ -4385,6 +4563,15 @@ func playerUI(app *App) {
 					p.cfg = *cfg
 					nativeAudioSetEQ(cfg.EQ)
 					fullRedraw = true
+				case 8:
+					app.stepVolume(-1)
+					redrawControls = true
+				case 9:
+					app.stepVolume(1)
+					redrawControls = true
+				case 10:
+					app.toggleMute()
+					redrawControls = true
 				}
 			}
 			if fullRedraw {
@@ -4393,11 +4580,11 @@ func playerUI(app *App) {
 				fb.present()
 				lastTrackKey = playerTrackKey(p)
 			} else if redrawControls {
-				_, _, qidx, qlen, paused, rep, shuf, stopped := playerSnapshot(p)
-				drawPlayerControls(fb, p, sel, l, paused, rep, shuf, stopped, qidx, qlen, cfg)
+				_, _, qidx, qlen, paused, rep, repOne, shuf, stopped := playerSnapshot(p)
+				drawPlayerControls(fb, p, sel, l, paused, rep, repOne, shuf, stopped, qidx, qlen, cfg)
 				drawPlayerDynamic(fb, p, l, sel, cfg)
 				fb.presentRegion(l.rightX-scaledPx(l.scale, 10), l.barY-scaledPx(l.scale, 12), l.rightW+scaledPx(l.scale, 20), l.barH+scaledPx(l.scale, 24))
-				ctrlTop := l.ctrlY - scaledPx(l.scale, 22)
+				ctrlTop := l.ctrlY - scaledPx(l.scale, 94)
 				fb.presentRegion(l.margin, ctrlTop, fb.w-l.margin*2, fb.h-ctrlTop)
 			}
 		case <-vizTick.C:
@@ -4955,6 +5142,7 @@ func settingsUI(app *App) {
 					app.player.mu.Lock()
 					cfg.SavedShuffle = app.player.q.Shuffle
 					cfg.SavedLoop = app.player.q.Repeat
+					cfg.SavedLoopOne = app.player.q.RepeatOne
 					app.player.mu.Unlock()
 				}
 			case 5:
@@ -5261,7 +5449,8 @@ func main() {
 	defer close(done)
 	webNowPlaying := make(chan struct{}, 1)
 	webStop := make(chan struct{}, 1)
-	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg, webNowPlaying: webNowPlaying, webStop: webStop}
+	playerRefresh := make(chan struct{}, 1)
+	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg, webNowPlaying: webNowPlaying, webStop: webStop, playerRefresh: playerRefresh}
 	defer cleanupSMBMounts()
 	defer func() {
 		if app.player != nil {

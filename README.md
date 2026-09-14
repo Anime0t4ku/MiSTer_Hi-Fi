@@ -375,7 +375,7 @@ Next Track         Next Track
 Previous Track     Previous Track
 ```
 
-Volume and mute media keys are not handled by MiSTer Hi-Fi because the application does not provide internal volume control.
+MiSTer Hi-Fi now provides its own internal 0-100% playback volume control. The player volume buttons move to the next or previous 5% step, while mute preserves the selected volume level.
 
 When the progress bar is selected:
 
@@ -394,11 +394,14 @@ Play / Pause
 Stop
 Next Track
 Shuffle
-Repeat
+Repeat All / Repeat One
+Volume Down / Volume Up / Mute
 Equalizer
 Progress Seeking
 Spectrum Visualizer
 ```
+
+Repeat cycles through Off, Repeat All, and Repeat One. Repeat All wraps the queue back to the first track, while Repeat One replays the current track.
 
 Playback continues while browsing other sources and folders.
 

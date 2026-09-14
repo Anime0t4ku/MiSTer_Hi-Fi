@@ -51,6 +51,9 @@ type webState struct {
 	QueueLength int     `json:"queue_length"`
 	Shuffle     bool    `json:"shuffle"`
 	Loop        bool    `json:"loop"`
+	LoopMode    string  `json:"loop_mode"`
+	Volume      int     `json:"volume"`
+	Muted       bool    `json:"muted"`
 	HasArt      bool    `json:"has_art"`
 	ArtKey      string  `json:"art_key"`
 }
@@ -181,6 +184,7 @@ func startWebRemote(app *App) *webRemote {
 	mux.HandleFunc("/api/play", w.handlePlay)
 	mux.HandleFunc("/api/control", w.handleControl)
 	mux.HandleFunc("/api/seek", w.handleSeek)
+	mux.HandleFunc("/api/volume", w.handleVolume)
 	mux.HandleFunc("/api/art", w.handleArt)
 	mux.HandleFunc("/ws", w.handleWS)
 	w.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
@@ -220,13 +224,23 @@ func (w *webRemote) Close() {
 }
 
 func (w *webRemote) state() webState {
-	s := webState{Connected: true, Version: version, State: "stopped"}
+	s := webState{Connected: true, Version: version, State: "stopped", LoopMode: "off"}
+	if w.app != nil && w.app.cfg != nil {
+		s.Volume, s.Muted = w.app.cfg.Volume, w.app.cfg.Muted
+	}
 	p := w.app.player
 	if p == nil {
 		return s
 	}
-	t, _, idx, qlen, paused, rep, shuf, stopped := playerSnapshot(p)
+	t, _, idx, qlen, paused, rep, repOne, shuf, stopped := playerSnapshot(p)
 	s.QueueIndex, s.QueueLength, s.Shuffle, s.Loop = idx, qlen, shuf, rep
+	if repOne {
+		s.LoopMode = "one"
+	} else if rep {
+		s.LoopMode = "all"
+	} else {
+		s.LoopMode = "off"
+	}
 	if !stopped {
 		if paused {
 			s.State = "paused"
@@ -561,13 +575,47 @@ func (w *webRemote) handleSeek(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(rw, w.state())
 }
 
+type webVolumeRequest struct {
+	Volume    *int  `json:"volume"`
+	Muted     *bool `json:"muted"`
+	Transient bool  `json:"transient"`
+}
+
+func (w *webRemote) handleVolume(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(rw, "method not allowed", 405)
+		return
+	}
+	var req webVolumeRequest
+	if json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req) != nil {
+		http.Error(rw, "invalid request", 400)
+		return
+	}
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	if req.Volume != nil {
+		if req.Transient {
+			w.app.setVolumeTransient(*req.Volume)
+		} else {
+			w.app.setVolume(*req.Volume)
+		}
+	}
+	if req.Muted != nil && w.app.cfg.Muted != *req.Muted {
+		w.app.toggleMute()
+	}
+	if req.Volume != nil || req.Muted != nil {
+		w.app.requestPlayerRefresh()
+	}
+	writeJSON(rw, w.state())
+}
+
 func (w *webRemote) handleArt(rw http.ResponseWriter, r *http.Request) {
 	p := w.app.player
 	if p == nil {
 		http.NotFound(rw, r)
 		return
 	}
-	t, _, _, _, _, _, _, _ := playerSnapshot(p)
+	t, _, _, _, _, _, _, _, _ := playerSnapshot(p)
 	art := t.Art
 	if w.app.cfg != nil && w.app.cfg.PrioritizeExternalArt && !strings.HasPrefix(t.Path, "cdda:") && !isHTTPURL(t.Path) {
 		if x := p.externalArtworkForTrackCached(t); x != nil {
@@ -707,13 +755,13 @@ func writeWSFrame(c net.Conn, opcode byte, payload []byte) error {
 }
 
 const webRemoteHTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>MiSTer Hi-Fi</title><style>
-:root{color-scheme:dark;--bg:#151515;--panel:#222;--panel2:#2c2c2c;--line:#444;--text:#f5f5f5;--muted:#aaa;--white:#fff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,Helvetica,sans-serif}.top{height:62px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 22px;font-weight:700;letter-spacing:.08em;background:#1b1b1b}.dot{width:9px;height:9px;border-radius:50%;background:#777;margin-left:auto}.dot.on{background:#eee}.layout{display:grid;grid-template-columns:minmax(280px,1fr) minmax(340px,480px);min-height:calc(100vh - 62px)}.browser{padding:22px;border-right:1px solid var(--line)}.player{padding:28px;background:#191919;display:flex;flex-direction:column;align-items:center}.sources{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.chip,button{background:#303030;color:#fff;border:1px solid #4a4a4a;border-radius:8px;padding:10px 13px;cursor:pointer}.chip.active{background:#efefef;color:#111}.path{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:10px 0}.list{border:1px solid var(--line);border-radius:10px;overflow:hidden}.entry{width:100%;display:flex;text-align:left;border:0;border-bottom:1px solid #383838;border-radius:0;background:#242424;padding:13px 15px}.entry:last-child{border-bottom:0}.entry:hover{background:#303030}.entry .kind{color:#999;margin-left:auto}.art{width:min(78vw,360px);aspect-ratio:1;border-radius:12px;background:#2b2b2b;object-fit:cover;box-shadow:0 12px 35px #0008}.meta{width:100%;margin-top:22px;text-align:center}.title{font-size:24px;font-weight:700}.artist,.album{color:#bbb;margin-top:6px}.progress{width:100%;margin-top:26px}.times{display:flex;justify-content:space-between;color:#aaa;font-size:12px;margin-top:6px}input[type=range]{width:100%;accent-color:#fff}.controls{display:flex;align-items:center;gap:12px;margin-top:22px}.controls button{width:48px;height:48px;border-radius:50%;font-size:17px;display:flex;align-items:center;justify-content:center}.controls button svg{width:22px;height:22px;display:block;fill:currentColor}.controls .main{width:62px;height:62px;background:#eee;color:#111;font-size:22px}.toggles{display:flex;gap:10px;margin-top:18px}.toggles button.active{background:#eee;color:#111}.status{margin-top:auto;padding-top:22px;color:#888;font-size:12px}.empty{padding:22px;color:#999}.mobile-tabs{display:none}@media(max-width:760px){.layout{display:block}.browser,.player{border:0;min-height:calc(100vh - 116px);padding:18px}.browser.hidden,.player.hidden{display:none}.mobile-tabs{position:fixed;bottom:0;left:0;right:0;height:54px;background:#1e1e1e;border-top:1px solid #444;display:flex}.mobile-tabs button{flex:1;border:0;border-radius:0}.art{width:min(72vw,330px)}body{padding-bottom:54px}}
-</style></head><body><div class="top">MISTER HI-FI<span id="dot" class="dot"></span></div><div class="layout"><section id="browser" class="browser"><div class="sources" id="sources"></div><div class="path" id="path">Select a source</div><div class="list" id="list"><div class="empty">Choose a source to browse music.</div></div></section><section id="player" class="player"><img id="art" class="art" alt="Album art"><div class="meta"><div id="title" class="title">Nothing playing</div><div id="artist" class="artist"></div><div id="album" class="album"></div></div><div class="progress"><input id="seek" type="range" min="0" max="1000" value="0"><div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div></div><div class="controls"><button onclick="control('previous')" aria-label="Previous"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="2.5" height="16"/><path d="M19.5 4v16L7 12z"/></svg></button><button id="play" class="main" onclick="control('playpause')">▶</button><button onclick="control('next')" aria-label="Next"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 4v16L17 12z"/><rect x="18.5" y="4" width="2.5" height="16"/></svg></button><button onclick="control('stop')">■</button></div><div class="toggles"><button id="shuffle" onclick="control('shuffle')">Shuffle</button><button id="loop" onclick="control('loop')">Loop</button></div><div class="status" id="status">Connecting…</div></section></div><div class="mobile-tabs"><button onclick="tab('player')">Now Playing</button><button onclick="tab('browser')">Browse</button></div><script>
-let currentSource='', currentPath='', rootPath='', state=null, dragging=false, ws=null, artKey=''; const $=id=>document.getElementById(id); function fmt(v){v=Math.max(0,Math.floor(v||0));return Math.floor(v/60)+':'+String(v%60).padStart(2,'0')} function tab(x){$('browser').classList.toggle('hidden',x!=='browser');$('player').classList.toggle('hidden',x!=='player')}
+:root{color-scheme:dark;--bg:#151515;--panel:#222;--panel2:#2c2c2c;--line:#444;--text:#f5f5f5;--muted:#aaa;--white:#fff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,Helvetica,sans-serif}.top{height:62px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 22px;font-weight:700;letter-spacing:.08em;background:#1b1b1b}.dot{width:9px;height:9px;border-radius:50%;background:#777;margin-left:auto}.dot.on{background:#eee}.layout{display:grid;grid-template-columns:minmax(280px,1fr) minmax(340px,480px);min-height:calc(100vh - 62px)}.browser{padding:22px;border-right:1px solid var(--line)}.player{padding:28px;background:#191919;display:flex;flex-direction:column;align-items:center}.sources{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.chip,button{background:#303030;color:#fff;border:1px solid #4a4a4a;border-radius:8px;padding:10px 13px;cursor:pointer}.chip.active{background:#efefef;color:#111}.path{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:10px 0}.list{border:1px solid var(--line);border-radius:10px;overflow:hidden}.entry{width:100%;display:flex;text-align:left;border:0;border-bottom:1px solid #383838;border-radius:0;background:#242424;padding:13px 15px}.entry:last-child{border-bottom:0}.entry:hover{background:#303030}.entry .kind{color:#999;margin-left:auto}.art{width:min(78vw,360px);aspect-ratio:1;border-radius:12px;background:#2b2b2b;object-fit:cover;box-shadow:0 12px 35px #0008}.meta{width:100%;margin-top:22px;text-align:center}.title{font-size:24px;font-weight:700}.artist,.album{color:#bbb;margin-top:6px}.progress{width:100%;margin-top:26px}.times{display:flex;justify-content:space-between;color:#aaa;font-size:12px;margin-top:6px}input[type=range]{width:100%;accent-color:#fff}.controls{display:flex;align-items:center;gap:12px;margin-top:22px}.controls button{width:48px;height:48px;border-radius:50%;font-size:17px;display:flex;align-items:center;justify-content:center}.controls button svg{width:22px;height:22px;display:block;fill:currentColor}.controls .main{width:62px;height:62px;background:#eee;color:#111;font-size:22px}.volume{width:100%;display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin-top:20px}.volume button{width:44px;height:44px;border-radius:50%;padding:0;font-size:18px}.volume .volpct{min-width:48px;text-align:right;color:#bbb;font-size:13px}.volrow{display:flex;align-items:center;gap:10px}.toggles{display:flex;gap:10px;margin-top:18px}.toggles button.active{background:#eee;color:#111}.status{margin-top:auto;padding-top:22px;color:#888;font-size:12px}.empty{padding:22px;color:#999}.mobile-tabs{display:none}@media(max-width:760px){.layout{display:block}.browser,.player{border:0;min-height:calc(100vh - 116px);padding:18px}.browser.hidden,.player.hidden{display:none}.mobile-tabs{position:fixed;bottom:0;left:0;right:0;height:54px;background:#1e1e1e;border-top:1px solid #444;display:flex}.mobile-tabs button{flex:1;border:0;border-radius:0}.art{width:min(72vw,330px)}body{padding-bottom:54px}}
+</style></head><body><div class="top">MISTER HI-FI<span id="dot" class="dot"></span></div><div class="layout"><section id="browser" class="browser"><div class="sources" id="sources"></div><div class="path" id="path">Select a source</div><div class="list" id="list"><div class="empty">Choose a source to browse music.</div></div></section><section id="player" class="player"><img id="art" class="art" alt="Album art"><div class="meta"><div id="title" class="title">Nothing playing</div><div id="artist" class="artist"></div><div id="album" class="album"></div></div><div class="progress"><input id="seek" type="range" min="0" max="1000" value="0"><div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div></div><div class="controls"><button onclick="control('previous')" aria-label="Previous"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="2.5" height="16"/><path d="M19.5 4v16L7 12z"/></svg></button><button id="play" class="main" onclick="control('playpause')">▶</button><button onclick="control('next')" aria-label="Next"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 4v16L17 12z"/><rect x="18.5" y="4" width="2.5" height="16"/></svg></button><button onclick="control('stop')">■</button></div><div class="volume"><button id="mute" onclick="toggleMute()" aria-label="Mute">🔊</button><div class="volrow"><input id="volume" type="range" min="0" max="100" value="100" aria-label="Volume"><span id="volpct" class="volpct">100%</span></div><span></span></div><div class="toggles"><button id="shuffle" onclick="control('shuffle')">Shuffle</button><button id="loop" onclick="control('loop')">Loop</button></div><div class="status" id="status">Connecting…</div></section></div><div class="mobile-tabs"><button onclick="tab('player')">Now Playing</button><button onclick="tab('browser')">Browse</button></div><script>
+let currentSource='', currentPath='', rootPath='', state=null, dragging=false, volumeDragging=false, ws=null, artKey=''; const $=id=>document.getElementById(id); function fmt(v){v=Math.max(0,Math.floor(v||0));return Math.floor(v/60)+':'+String(v%60).padStart(2,'0')} function tab(x){$('browser').classList.toggle('hidden',x!=='browser');$('player').classList.toggle('hidden',x!=='player')}
 async function api(path,opt){const r=await fetch(path,opt);if(!r.ok)throw new Error(await r.text());return r.headers.get('content-type')?.includes('json')?r.json():r.text()} async function sources(){const a=await api('/api/sources');$('sources').innerHTML='';a.forEach(s=>{let b=document.createElement('button');b.className='chip';b.textContent=s.name;b.onclick=()=>openSource(s.id,b);$('sources').appendChild(b)})}
 async function openSource(id,b){currentSource=id;currentPath='';document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));b?.classList.add('active');await browse('')} async function browse(path){try{const d=await api('/api/browse?source='+encodeURIComponent(currentSource)+'&path='+encodeURIComponent(path||''));currentPath=d.path||'';rootPath=d.root||'';$('path').textContent=currentPath||currentSource;const l=$('list');l.innerHTML='';if(currentPath&&rootPath&&currentPath!==rootPath){let up=document.createElement('button');up.className='entry';up.innerHTML='<span>..</span><span class="kind">Folder</span>';up.onclick=()=>browse(currentPath.substring(0,currentPath.lastIndexOf('/'))||rootPath);l.appendChild(up)}d.entries.forEach(e=>{let x=document.createElement('button');x.className='entry';x.innerHTML='<span>'+escapeHtml(e.name)+'</span><span class="kind">'+(e.is_dir?'Folder':'Track')+'</span>';x.onclick=()=>e.is_dir?browse(e.path):play(e.path);l.appendChild(x)});if(!d.entries.length){let empty=document.createElement('div');empty.className='empty';empty.textContent='No playable items found.';l.appendChild(empty)}}catch(e){$('list').innerHTML='<div class="empty">'+escapeHtml(String(e.message||e))+'</div>'}}
 async function play(path){await api('/api/play',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:currentSource,path})});if(innerWidth<=760)tab('player')} async function control(action){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})})}
-function render(s){state=s;$('dot').classList.toggle('on',s.connected);$('status').textContent=s.connected?'Connected to MiSTer Hi-Fi':'Disconnected from MiSTer Hi-Fi';$('title').textContent=s.title||'Nothing playing';$('artist').textContent=s.artist||'';$('album').textContent=s.album||'';$('play').textContent=s.state==='playing'?'❚❚':'▶';$('shuffle').classList.toggle('active',s.shuffle);$('loop').classList.toggle('active',s.loop);if(!dragging){$('seek').value=s.duration>0?Math.round(1000*s.position/s.duration):0}$('pos').textContent=fmt(s.position);$('dur').textContent=fmt(s.duration);if(s.has_art&&s.art_key!==artKey){artKey=s.art_key;$('art').src='/api/art?k='+encodeURIComponent(artKey)}else if(!s.has_art){artKey='';$('art').removeAttribute('src')}}
+function render(s){state=s;$('dot').classList.toggle('on',s.connected);$('status').textContent=s.connected?'Connected to MiSTer Hi-Fi':'Disconnected from MiSTer Hi-Fi';$('title').textContent=s.title||'Nothing playing';$('artist').textContent=s.artist||'';$('album').textContent=s.album||'';$('play').textContent=s.state==='playing'?'❚❚':'▶';$('shuffle').classList.toggle('active',s.shuffle);$('loop').classList.toggle('active',s.loop);$('loop').textContent=s.loop_mode==='one'?'Loop 1':'Loop';$('loop').classList.toggle('active',s.loop_mode!=='off');if(!volumeDragging){$('volume').value=s.volume??100;$('volpct').textContent=(s.volume??100)+'%'}$('mute').textContent=s.muted?'🔇':'🔊';$('mute').classList.toggle('active',!!s.muted);if(!dragging){$('seek').value=s.duration>0?Math.round(1000*s.position/s.duration):0}$('pos').textContent=fmt(s.position);$('dur').textContent=fmt(s.duration);if(s.has_art&&s.art_key!==artKey){artKey=s.art_key;$('art').src='/api/art?k='+encodeURIComponent(artKey)}else if(!s.has_art){artKey='';$('art').removeAttribute('src')}}
 function connect(){const proto=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(proto+'://'+location.host+'/ws');ws.onmessage=e=>{try{render(JSON.parse(e.data))}catch{}};ws.onopen=()=>{$('dot').classList.add('on')};ws.onclose=()=>{$('dot').classList.remove('on');$('status').textContent='Disconnected from MiSTer Hi-Fi';setTimeout(connect,1500)};ws.onerror=()=>ws.close()}
-$('seek').addEventListener('pointerdown',()=>dragging=true);$('seek').addEventListener('input',()=>{if(state&&state.duration>0){let p=state.duration*$('seek').value/1000;$('pos').textContent=fmt(p)}});$('seek').addEventListener('change',async()=>{if(state&&state.duration>0){let p=state.duration*$('seek').value/1000;await api('/api/seek',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position:p})})}dragging=false});$('seek').addEventListener('pointerup',()=>dragging=false);function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))} sources();connect();if(innerWidth<=760)tab('player');
+$('seek').addEventListener('pointerdown',()=>dragging=true);$('seek').addEventListener('input',()=>{if(state&&state.duration>0){let p=state.duration*$('seek').value/1000;$('pos').textContent=fmt(p)}});$('seek').addEventListener('change',async()=>{if(state&&state.duration>0){let p=state.duration*$('seek').value/1000;await api('/api/seek',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position:p})})}dragging=false});$('seek').addEventListener('pointerup',()=>dragging=false);let volumeTimer=null,volumeInFlight=false,pendingVolume=null;async function sendVolume(v,transient=false){volumeInFlight=true;try{return await api('/api/volume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({volume:Number(v),transient})})}finally{volumeInFlight=false;if(pendingVolume!==null){const n=pendingVolume;pendingVolume=null;queueVolume(n)}}}function queueVolume(v){pendingVolume=Number(v);if(volumeInFlight)return;clearTimeout(volumeTimer);volumeTimer=setTimeout(()=>{const n=pendingVolume;pendingVolume=null;if(n!==null)sendVolume(n,true)},20)}async function commitVolume(v){clearTimeout(volumeTimer);pendingVolume=null;while(volumeInFlight){await new Promise(r=>setTimeout(r,5))}await sendVolume(v,false)}function toggleMute(){return api('/api/volume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({muted:!(state&&state.muted)})})}$('volume').addEventListener('pointerdown',()=>volumeDragging=true);$('volume').addEventListener('input',()=>{volumeDragging=true;$('volpct').textContent=$('volume').value+'%';queueVolume($('volume').value)});$('volume').addEventListener('change',async()=>{await commitVolume($('volume').value);volumeDragging=false});$('volume').addEventListener('pointerup',()=>{});function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))} sources();connect();if(innerWidth<=760)tab('player');
 </script></body></html>`
