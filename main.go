@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.11.1"
+const version = "1.11.2"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -2406,8 +2406,13 @@ func (p *Player) nextQueueIndexLocked(from int) int {
 	if len(p.q.Tracks) == 0 || from < 0 || from >= len(p.q.Tracks) {
 		return -1
 	}
+	// Repeat One deliberately does not use the gapless pre-queue path. Reopening
+	// the same decoder through the native gapless handoff can race with repeat
+	// mode changes because the next decoder may already have been pre-decoded
+	// before the audible track boundary. Let the current track end normally and
+	// have advanceUnlocked() restart it instead.
 	if p.q.Repeat && p.q.RepeatOne {
-		return from
+		return -1
 	}
 	if p.q.Shuffle {
 		return -1
@@ -3216,6 +3221,50 @@ func (a *App) nowPlayingText() string {
 	return prefix + ": " + name
 }
 
+func (p *Player) restartCurrentFileAtPositionUnlocked(position float64, paused bool) error {
+	p.stopPlaybackRawUnlocked()
+	p.mu.Lock()
+	if p.q.Index < 0 || p.q.Index >= len(p.q.Tracks) {
+		p.mu.Unlock()
+		return errors.New("empty queue")
+	}
+	idx := p.q.Index
+	t := p.q.Tracks[idx]
+	cfg := p.cfg
+	stop := make(chan struct{})
+	p.stop = stop
+	p.generation++
+	generation := p.generation
+	p.paused = false
+	p.stopped = false
+	p.basePosition = 0
+	p.gaplessQueuedIndex = -1
+	p.mu.Unlock()
+
+	if err := nativeAudioStartTrack(t, cfg.EQ); err != nil {
+		p.mu.Lock()
+		if p.stop == stop {
+			p.stop = nil
+			p.stopped = true
+		}
+		p.mu.Unlock()
+		return err
+	}
+
+	if position > 0 {
+		_ = nativeAudioSeek(position)
+	}
+	if paused {
+		p.mu.Lock()
+		p.paused = true
+		p.mu.Unlock()
+		nativeAudioPause(true)
+	}
+	p.prepareGaplessNextFile()
+	go p.monitorPlayback(stop, generation)
+	return nil
+}
+
 func (a *App) cycleRepeat() {
 	if a.player == nil {
 		return
@@ -3223,6 +3272,7 @@ func (a *App) cycleRepeat() {
 	p := a.player
 	p.opMu.Lock()
 	p.mu.Lock()
+	oldQueuedIndex := p.gaplessQueuedIndex
 	if !p.q.Repeat {
 		p.q.Repeat = true
 		p.q.RepeatOne = false
@@ -3233,21 +3283,36 @@ func (a *App) cycleRepeat() {
 		p.q.RepeatOne = false
 	}
 	rep, one := p.q.Repeat, p.q.RepeatOne
-	refreshGapless := p.cfg.GaplessPlayback && !p.stopped && p.q.Index >= 0 && p.q.Index < len(p.q.Tracks) &&
+	filePlayback := p.cfg.GaplessPlayback && !p.stopped && p.q.Index >= 0 && p.q.Index < len(p.q.Tracks) &&
 		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "cdda:") &&
 		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "vcdcue:") &&
 		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "vcdchd:") &&
 		!isHTTPURL(p.q.Tracks[p.q.Index].Path)
-	p.gaplessQueuedIndex = -1
+	desiredQueuedIndex := -1
+	if filePlayback {
+		desiredQueuedIndex = p.nextQueueIndexLocked(p.q.Index)
+	}
+	paused := p.paused
 	p.mu.Unlock()
 
-	// File playback pre-queues the next gapless track. When the repeat mode changes,
-	// discard that stale choice and queue the track that matches the new mode.
-	// Without this, the icon/state changes immediately but the next transition can
-	// still follow the repeat mode that was active when playback started.
-	if refreshGapless {
-		nativeAudioClearQueuedNext()
-		p.prepareGaplessNextFile()
+	if filePlayback {
+		// A gapless decoder can consume the queued next file before that track is
+		// audible. If the new repeat mode changes/removes an existing queued target,
+		// merely clearing the queue can therefore be too late. Rebuild the current
+		// decoder at the audible position so playback state and decoder state agree.
+		if oldQueuedIndex >= 0 && oldQueuedIndex != desiredQueuedIndex {
+			position := nativeAudioPosition()
+			if position < 0 {
+				position = 0
+			}
+			_ = p.restartCurrentFileAtPositionUnlocked(position, paused)
+		} else {
+			nativeAudioClearQueuedNext()
+			p.mu.Lock()
+			p.gaplessQueuedIndex = -1
+			p.mu.Unlock()
+			p.prepareGaplessNextFile()
+		}
 	}
 	p.opMu.Unlock()
 
