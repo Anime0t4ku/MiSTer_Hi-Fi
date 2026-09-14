@@ -290,6 +290,12 @@ func nativeAudioQueueNextTrack(t Track) error {
 	return nil
 }
 
+func nativeAudioClearQueuedNext() {
+	nativeAudioControlMu.Lock()
+	defer nativeAudioControlMu.Unlock()
+	C.mh_audio_clear_queued_next()
+}
+
 func nativeAudioMarkPCMTransition(nextDuration float64) error {
 	nativeAudioControlMu.Lock()
 	defer nativeAudioControlMu.Unlock()

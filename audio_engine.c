@@ -998,6 +998,14 @@ int mh_audio_queue_next_fd(int fd) {
     return 0;
 }
 
+void mh_audio_clear_queued_next(void) {
+    pthread_mutex_lock(&g.next_mutex);
+    if (g.next_fd >= 0) close(g.next_fd);
+    g.next_fd = -1;
+    g.next_fd_ready = 0;
+    pthread_mutex_unlock(&g.next_mutex);
+}
+
 int mh_audio_mark_pcm_transition(double next_duration) {
     if (g.mode != 2 || !g.ring_init || g.transition_armed) return -1;
     g.pending_duration = next_duration;

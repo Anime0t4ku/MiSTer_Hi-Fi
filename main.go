@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.11.0"
+const version = "1.11.1"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -3220,18 +3220,37 @@ func (a *App) cycleRepeat() {
 	if a.player == nil {
 		return
 	}
-	a.player.mu.Lock()
-	if !a.player.q.Repeat {
-		a.player.q.Repeat = true
-		a.player.q.RepeatOne = false
-	} else if !a.player.q.RepeatOne {
-		a.player.q.RepeatOne = true
+	p := a.player
+	p.opMu.Lock()
+	p.mu.Lock()
+	if !p.q.Repeat {
+		p.q.Repeat = true
+		p.q.RepeatOne = false
+	} else if !p.q.RepeatOne {
+		p.q.RepeatOne = true
 	} else {
-		a.player.q.Repeat = false
-		a.player.q.RepeatOne = false
+		p.q.Repeat = false
+		p.q.RepeatOne = false
 	}
-	rep, one := a.player.q.Repeat, a.player.q.RepeatOne
-	a.player.mu.Unlock()
+	rep, one := p.q.Repeat, p.q.RepeatOne
+	refreshGapless := p.cfg.GaplessPlayback && !p.stopped && p.q.Index >= 0 && p.q.Index < len(p.q.Tracks) &&
+		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "cdda:") &&
+		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "vcdcue:") &&
+		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "vcdchd:") &&
+		!isHTTPURL(p.q.Tracks[p.q.Index].Path)
+	p.gaplessQueuedIndex = -1
+	p.mu.Unlock()
+
+	// File playback pre-queues the next gapless track. When the repeat mode changes,
+	// discard that stale choice and queue the track that matches the new mode.
+	// Without this, the icon/state changes immediately but the next transition can
+	// still follow the repeat mode that was active when playback started.
+	if refreshGapless {
+		nativeAudioClearQueuedNext()
+		p.prepareGaplessNextFile()
+	}
+	p.opMu.Unlock()
+
 	if a.cfg.RememberShuffleLoop {
 		a.cfg.SavedLoop = rep
 		a.cfg.SavedLoopOne = one

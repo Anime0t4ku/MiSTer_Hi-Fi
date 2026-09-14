@@ -6,6 +6,7 @@ int mh_audio_start_stream_fd(int fd, int encoding, int eq_enabled, float bass, f
 int mh_audio_start_m4a_fd(int fd, int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble);
 int mh_audio_start_pcm(int eq_enabled, float bass, float lowmid, float mid, float highmid, float treble);
 int mh_audio_queue_next_fd(int fd);
+void mh_audio_clear_queued_next(void);
 int mh_audio_mark_pcm_transition(double next_duration);
 int mh_audio_take_transition(void);
 int mh_audio_write_pcm(const void* data, size_t bytes);
