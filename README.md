@@ -343,6 +343,27 @@ R1       Next Track
 Start    Now Playing
 ```
 
+### List navigation (v1.12.0)
+
+Settings includes list jump size, page jump size, wrap list navigation, hold to repeat, hold delay, and repeat interval. Left/right on the D-pad or keyboard jump 5 entries by default; keyboard Page Up/Down jump 10. Jump sizes can be selected from 1, 5, 10, 25, 50, 100, 250, 500, or 1000 entries.
+
+Wrapping is enabled by default: a jump past the top goes to the last entry, and a jump past the bottom goes to the first. Blank separators are skipped. The Now Playing bar remains accessible with Down from the last list entry.
+
+Holding a direction in a browser list repeats after 400 ms, then every 150 ms by default. Releasing the direction stops repetition. Hold repetition does not apply to playback seeking or settings changes. Settings scroll automatically to keep the selected option visible.
+
+These values are saved in the existing `config.json` under `navigation`:
+
+```json
+"navigation": {
+  "jump_entries": 5,
+  "page_jump_entries": 10,
+  "wrap": true,
+  "hold_repeat": true,
+  "hold_delay_ms": 400,
+  "repeat_interval_ms": 150
+}
+```
+
 ### Keyboard
 
 ```text

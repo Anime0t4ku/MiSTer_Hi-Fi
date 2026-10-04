@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.11.2"
+const version = "1.12.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -43,28 +43,29 @@ var screenSaverSeconds atomic.Int64
 var screenSaverActive atomic.Bool
 
 type Config struct {
-	EQ                    EQConfig     `json:"eq"`
-	Visualizer            string       `json:"visualizer"`
-	OLEDMode              bool         `json:"oled_mode"`
-	HideAlbumArt          bool         `json:"hide_album_art"`
-	AutoHideMissingArt    bool         `json:"auto_hide_missing_art"`
-	PrioritizeExternalArt bool         `json:"prioritize_external_art"`
-	RememberShuffleLoop   bool         `json:"remember_shuffle_loop"`
-	SavedShuffle          bool         `json:"saved_shuffle"`
-	SavedLoop             bool         `json:"saved_loop"`
-	SavedLoopOne          bool         `json:"saved_loop_one"`
-	Volume                int          `json:"volume"`
-	Muted                 bool         `json:"muted"`
-	ShowClock             bool         `json:"show_clock"`
-	ConfirmOnExit         bool         `json:"confirm_on_exit"`
-	ScreenSaverSeconds    int          `json:"screensaver_seconds"`
-	GaplessPlayback       bool         `json:"gapless_playback"`
-	SwapAB                bool         `json:"swap_ab"`
-	SwapXY                bool         `json:"swap_xy"`
-	CustomFont            string       `json:"custom_font"`
-	WebRemoteEnabled      bool         `json:"web_remote_enabled"`
-	WebRemotePort         int          `json:"web_remote_port"`
-	LastFM                LastFMConfig `json:"lastfm"`
+	Navigation            NavigationConfig `json:"navigation"`
+	EQ                    EQConfig         `json:"eq"`
+	Visualizer            string           `json:"visualizer"`
+	OLEDMode              bool             `json:"oled_mode"`
+	HideAlbumArt          bool             `json:"hide_album_art"`
+	AutoHideMissingArt    bool             `json:"auto_hide_missing_art"`
+	PrioritizeExternalArt bool             `json:"prioritize_external_art"`
+	RememberShuffleLoop   bool             `json:"remember_shuffle_loop"`
+	SavedShuffle          bool             `json:"saved_shuffle"`
+	SavedLoop             bool             `json:"saved_loop"`
+	SavedLoopOne          bool             `json:"saved_loop_one"`
+	Volume                int              `json:"volume"`
+	Muted                 bool             `json:"muted"`
+	ShowClock             bool             `json:"show_clock"`
+	ConfirmOnExit         bool             `json:"confirm_on_exit"`
+	ScreenSaverSeconds    int              `json:"screensaver_seconds"`
+	GaplessPlayback       bool             `json:"gapless_playback"`
+	SwapAB                bool             `json:"swap_ab"`
+	SwapXY                bool             `json:"swap_xy"`
+	CustomFont            string           `json:"custom_font"`
+	WebRemoteEnabled      bool             `json:"web_remote_enabled"`
+	WebRemotePort         int              `json:"web_remote_port"`
+	LastFM                LastFMConfig     `json:"lastfm"`
 }
 type EQConfig struct {
 	Enabled                            bool `json:"enabled"`
@@ -713,6 +714,8 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 				_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(eviocgrab), uintptr(0))
 				f.Close()
 			}()
+			repeater := newNavigationRepeater(ch, done)
+			defer repeater.close()
 			var hx, hy int32
 			pressed := map[uint16]bool{}
 			for {
@@ -728,6 +731,7 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 
 				if misterMap != nil {
 					if a, handled, face := misterMap.process(f, ev); handled {
+						repeater.update(ev, a, (ev.Type == evKey && ev.Value == 0) || (ev.Type == evAbs && axisDigitalState(ev.Value, misterMap.absInfoFor(f, ev.Code)) == 0))
 						emit(a, face)
 						continue
 					}
@@ -838,6 +842,7 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 						}
 					}
 				}
+				repeater.update(ev, a, ev.Value == 0)
 				emit(a, face)
 			}
 		}(f, misterMap)
@@ -869,7 +874,7 @@ func (t *termState) restore() {
 }
 
 func defaultConfig() Config {
-	return Config{Visualizer: "bars", ConfirmOnExit: true, WebRemoteEnabled: true, WebRemotePort: defaultWebRemotePort, Volume: 100}
+	return Config{Navigation: defaultNavigationConfig(), Visualizer: "bars", ConfirmOnExit: true, WebRemoteEnabled: true, WebRemotePort: defaultWebRemotePort, Volume: 100}
 }
 func loadConfig() Config {
 	c := defaultConfig()
@@ -916,6 +921,7 @@ func loadConfig() Config {
 	if c.Volume > 100 {
 		c.Volume = 100
 	}
+	c.Navigation.normalize()
 	saveConfig(c)
 	return c
 }
@@ -3586,6 +3592,7 @@ func menu(app *App, title string, items []string, initial int) (int, bool) {
 }
 
 func menuWithEntryCounter(app *App, title string, items []string, initial int, showEntryCounter bool) (int, bool) {
+	defer setNavigationActive(false)
 	fb, acts := app.fb, app.acts
 	clockTick := time.NewTicker(30 * time.Second)
 	defer clockTick.Stop()
@@ -3594,6 +3601,8 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 		sel = 0
 	}
 	for {
+		configureNavigation(app.cfg.Navigation)
+		setNavigationActive(true)
 		if app.jumpSources {
 			return 0, false
 		}
@@ -3679,6 +3688,13 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 			}
 			continue
 		}
+		if a >= repeatActionBase {
+			var valid bool
+			a, valid = decodeNavigationRepeat(a)
+			if !valid {
+				continue
+			}
+		}
 		if a == actSources {
 			app.jumpSources = true
 			return 0, false
@@ -3697,6 +3713,10 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 		}
 		switch a {
 		case actUp:
+			if sel == 0 && app.cfg.Navigation.Wrap {
+				sel = moveListSelection(items, sel, -1, true)
+				break
+			}
 			if barSel {
 				for i := len(items) - 1; i >= 0; i-- {
 					if items[i] != "" {
@@ -3714,23 +3734,11 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 			}
 		case actPageUp:
 			if !barSel {
-				sel -= 10
-				if sel < 0 {
-					sel = 0
-				}
-				for sel > 0 && items[sel] == "" {
-					sel--
-				}
+				sel = moveListSelection(items, sel, -app.cfg.Navigation.PageJump, app.cfg.Navigation.Wrap)
 			}
 		case actPageDown:
 			if !barSel {
-				sel += 10
-				if sel >= len(items) {
-					sel = len(items) - 1
-				}
-				for sel < len(items)-1 && items[sel] == "" {
-					sel++
-				}
+				sel = moveListSelection(items, sel, app.cfg.Navigation.PageJump, app.cfg.Navigation.Wrap)
 			}
 		case actFirst:
 			barSel = false
@@ -3745,6 +3753,10 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 				sel--
 			}
 		case actDown:
+			if app.cfg.Navigation.Wrap && (barSel || (!hasBar && sel == len(items)-1)) {
+				sel = moveListSelection(items, len(items)-1, 1, true)
+				break
+			}
 			moved := false
 			for i := sel + 1; i < len(items); i++ {
 				if items[i] != "" {
@@ -3755,26 +3767,16 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 			}
 			if !moved && hasBar && !barSel {
 				sel = len(items)
+			} else if !moved && !hasBar && app.cfg.Navigation.Wrap {
+				sel = moveListSelection(items, len(items)-1, 1, true)
 			}
 		case actLeft:
 			if !barSel {
-				sel -= 5
-				if sel < 0 {
-					sel = 0
-				}
-				for sel > 0 && items[sel] == "" {
-					sel--
-				}
+				sel = moveListSelection(items, sel, -app.cfg.Navigation.Jump, app.cfg.Navigation.Wrap)
 			}
 		case actRight:
 			if !barSel {
-				sel += 5
-				if sel >= len(items) {
-					sel = len(items) - 1
-				}
-				for sel < len(items)-1 && items[sel] == "" {
-					sel++
-				}
+				sel = moveListSelection(items, sel, app.cfg.Navigation.Jump, app.cfg.Navigation.Wrap)
 			}
 		case actConfirm:
 			if !barSel && sel >= 0 && sel < len(items) && items[sel] == "" {
@@ -4472,6 +4474,7 @@ func playerTrackKey(p *Player) string {
 }
 
 func playerUI(app *App) {
+	setNavigationActive(false)
 	p := app.player
 	if p == nil {
 		return
@@ -5044,6 +5047,7 @@ func confirmExitUI(app *App) bool {
 }
 
 func settingsUI(app *App) {
+	setNavigationActive(false)
 	fb, acts, cfg := app.fb, app.acts, app.cfg
 	clockTick := time.NewTicker(30 * time.Second)
 	defer clockTick.Stop()
@@ -5061,6 +5065,12 @@ func settingsUI(app *App) {
 		"SWAP A/B",
 		"SWAP X/Y",
 		"CUSTOM FALLBACK FONT",
+		"LIST JUMP SIZE",
+		"PAGE JUMP SIZE",
+		"WRAP LIST NAVIGATION",
+		"HOLD TO REPEAT",
+		"HOLD DELAY",
+		"REPEAT INTERVAL",
 	}
 	fonts := scanCustomFonts()
 	applyCustomFont(cfg, fonts)
@@ -5099,9 +5109,11 @@ func settingsUI(app *App) {
 		y0 := max(66, fb.h/15)
 		bottomReserve := max(82, fb.h/11)
 		row := (fb.h - y0 - bottomReserve) / len(labels)
-		if row < 34 {
-			row = 34
+		if row < 40 {
+			row = 40
 		}
+		visibleRows := max(1, (fb.h-y0-bottomReserve)/row)
+		first := max(0, sel-visibleRows+1)
 		values := []string{
 			onoff(cfg.OLEDMode),
 			onoff(!cfg.HideAlbumArt),
@@ -5115,10 +5127,16 @@ func settingsUI(app *App) {
 			onoff(cfg.SwapAB),
 			onoff(cfg.SwapXY),
 			customFontLabel(cfg, fonts),
+			fmt.Sprintf("%d ENTRIES", cfg.Navigation.Jump),
+			fmt.Sprintf("%d ENTRIES", cfg.Navigation.PageJump),
+			onoff(cfg.Navigation.Wrap),
+			onoff(cfg.Navigation.HoldRepeat),
+			fmt.Sprintf("%d MS", cfg.Navigation.DelayMS),
+			fmt.Sprintf("%d MS", cfg.Navigation.IntervalMS),
 		}
 		ts := max(1, row/22)
-		for i := range labels {
-			y := y0 + i*row
+		for i := first; i < len(labels) && i < first+visibleRows; i++ {
+			y := y0 + (i-first)*row
 			rowEnabled := enabled(i)
 			if sel == i && rowEnabled {
 				fb.rect(45, y-4, fb.w-90, row-3, color.RGBA{35, 37, 46, 255})
@@ -5256,6 +5274,25 @@ func settingsUI(app *App) {
 			case 10:
 				cfg.SwapXY = !cfg.SwapXY
 				swapXYInput.Store(cfg.SwapXY)
+			case 12, 13, 16, 17:
+				dir := 1
+				if a == actLeft {
+					dir = -1
+				}
+				switch sel {
+				case 12:
+					cfg.Navigation.Jump = cycleNavigationValue(cfg.Navigation.Jump, dir, []int{1, 5, 10, 25, 50, 100, 250, 500, 1000})
+				case 13:
+					cfg.Navigation.PageJump = cycleNavigationValue(cfg.Navigation.PageJump, dir, []int{1, 5, 10, 25, 50, 100, 250, 500, 1000})
+				case 16:
+					cfg.Navigation.DelayMS = cycleNavigationValue(cfg.Navigation.DelayMS, dir, []int{200, 300, 400, 500, 750, 1000})
+				case 17:
+					cfg.Navigation.IntervalMS = cycleNavigationValue(cfg.Navigation.IntervalMS, dir, []int{50, 100, 150, 200, 250, 500, 1000})
+				}
+			case 14:
+				cfg.Navigation.Wrap = !cfg.Navigation.Wrap
+			case 15:
+				cfg.Navigation.HoldRepeat = !cfg.Navigation.HoldRepeat
 			case 11:
 				dir := 1
 				if a == actLeft {
