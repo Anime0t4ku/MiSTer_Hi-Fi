@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"image"
 	"testing"
 	"time"
 )
@@ -98,5 +99,45 @@ func TestNavigationRepeatReleaseAndScope(t *testing.T) {
 	case <-ch:
 		t.Fatal("repeat when disabled")
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestEQPresetCycle(t *testing.T) {
+	e := EQConfig{Bass: 1}
+	if eqPresetName(e) != "CUSTOM" {
+		t.Fatal("expected CUSTOM")
+	}
+	cycleEQPreset(&e, 1)
+	if !e.Enabled || eqPresetName(e) != "FLAT" {
+		t.Fatalf("got %+v", e)
+	}
+	cycleEQPreset(&e, -1)
+	if eqPresetName(e) != eqPresets[len(eqPresets)-1].Name {
+		t.Fatalf("wrap failed: %+v", e)
+	}
+	for _, p := range eqPresets {
+		for _, g := range []float64{p.Bass, p.LowMid, p.Mid, p.HighMid, p.Treble} {
+			if g < -6 || g > 6 {
+				t.Fatalf("%s out of range", p.Name)
+			}
+		}
+	}
+}
+
+func TestScaleDownBilinear(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 800, 600))
+	for i := range src.Pix {
+		src.Pix[i] = 200
+	}
+	dst := scaleDownBilinear(src, 400)
+	if dst.Bounds().Dx() != 400 || dst.Bounds().Dy() != 300 {
+		t.Fatalf("got %v", dst.Bounds())
+	}
+	if r, _, _, _ := dst.At(10, 10).RGBA(); r>>8 != 200 {
+		t.Fatalf("colour changed: %d", r>>8)
+	}
+	small := scaleDownBilinear(image.NewRGBA(image.Rect(0, 0, 100, 50)), 400)
+	if small.Bounds().Dx() != 100 || small.Bounds().Dy() != 50 {
+		t.Fatalf("small image resized: %v", small.Bounds())
 	}
 }

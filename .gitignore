@@ -7,3 +7,8 @@ Scripts/.config/MiSTerHiFi/config.json
 stb_vorbis.h
 
 third_party/libchdr/
+
+# Plex credentials and generated per-device identity
+plex.json
+plex-client-id
+plex-*.tmp

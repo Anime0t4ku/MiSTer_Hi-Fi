@@ -2,7 +2,7 @@
 
 MiSTer Hi-Fi is a controller-first music player for MiSTer FPGA.
 
-It supports local music, USB storage, SMB shares, online radio, playlists, Physical CDs, Virtual CDs from CHD and BIN/CUE disc images, album artwork, a spectrum visualizer, equalizer, OLED mode, custom fallback fonts, and direct launching through NFC using Zaparoo.
+It supports local music, USB storage, SMB shares, Plex music libraries, online radio, playlists, Physical CDs, Virtual CDs from CHD and BIN/CUE disc images, album artwork, a spectrum visualizer, equalizer with genre presets, OLED mode, custom fallback fonts, and direct launching through NFC using Zaparoo.
 
 ## Installation
 
@@ -17,7 +17,9 @@ The files are installed under:
     └── MiSTerHiFi/
         ├── mister_hifi
         ├── smb.example.json
-        └── radio.example.json
+        ├── radio.example.json
+        ├── plex.example.json
+        └── PLEX.md
 ```
 
 MiSTer Hi-Fi creates its configuration automatically on first launch.
@@ -36,12 +38,20 @@ MiSTer Hi-Fi can browse and play music from:
 SD Card
 USB
 SMB
+Plex
 Online Radio
 Virtual CD
 Physical Audio CD
 ```
 
 Music can be browsed directly from the source list.
+
+### Plex
+
+Browse artists, albums sorted by artist, the 100 most recently added albums, and audio playlists from the MiSTer or Web Remote. Configure your server and token through **Web Remote > Plex settings**, or copy `plex.example.json` to `plex.json` next to the player executable. An empty library ID selects the first music library.
+
+Plex uses original-file downloads into a bounded temporary cache and the existing audio engine; it does not transcode or provide gapless playback. Stop and Next cancel pending downloads. Choose Plex, Hi-Fi Last.fm, or no scrobbling in Plex settings.
+
 
 ### Virtual CD
 

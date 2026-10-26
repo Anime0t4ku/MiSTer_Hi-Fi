@@ -27,6 +27,8 @@ command -v go >/dev/null 2>&1 || {
 
 mkdir -p Scripts/.config/MiSTerHiFi
 cp radio.example.json Scripts/.config/MiSTerHiFi/radio.example.json
+cp plex.example.json Scripts/.config/MiSTerHiFi/plex.example.json
+cp PLEX.md Scripts/.config/MiSTerHiFi/PLEX.md
 
 command -v cargo >/dev/null 2>&1 || {
     echo "Error: Rust/Cargo is required for M4A (AAC/ALAC) support." >&2

@@ -62,6 +62,8 @@ jobs:
         run: |
           test -f Scripts/.config/MiSTerHiFi/mister_hifi
           test -f Scripts/.config/MiSTerHiFi/radio.example.json
+          test -f Scripts/.config/MiSTerHiFi/plex.example.json
+          test -f Scripts/.config/MiSTerHiFi/PLEX.md
           test -f Scripts/misterhifi.sh
 
           file Scripts/.config/MiSTerHiFi/mister_hifi
@@ -72,7 +74,7 @@ jobs:
       - name: Package MiSTer Hi-Fi
         run: |
           rm -f MiSTer_Hi-Fi.zip
-          zip -r MiSTer_Hi-Fi.zip Scripts
+          zip -r MiSTer_Hi-Fi.zip Scripts -x '*/plex.json' '*/plex-client-id' '*/plex-*.tmp'
 
       - name: Verify Release Package
         run: |
@@ -80,6 +82,8 @@ jobs:
           unzip -l MiSTer_Hi-Fi.zip | grep -q 'Scripts/.config/MiSTerHiFi/mister_hifi'
           unzip -l MiSTer_Hi-Fi.zip | grep -q 'Scripts/.config/MiSTerHiFi/radio.example.json'
           unzip -l MiSTer_Hi-Fi.zip | grep -q 'Scripts/misterhifi.sh'
+          unzip -l MiSTer_Hi-Fi.zip | grep -q 'Scripts/.config/MiSTerHiFi/plex.example.json'
+          unzip -l MiSTer_Hi-Fi.zip | grep -q 'Scripts/.config/MiSTerHiFi/PLEX.md'
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4

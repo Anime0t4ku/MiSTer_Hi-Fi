@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -30,7 +31,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.12.0"
+const version = "1.13.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -93,6 +94,9 @@ type Track struct {
 	MediaFormat                   string
 	BitDepth, SampleRate, BitRate int
 	Art                           image.Image
+	PlexKey, PlexPart, PlexExt    string
+	PlexThumb                     string
+	PlexSource                    *PlexConfig
 }
 type Queue struct {
 	Tracks                     []Track
@@ -2211,6 +2215,10 @@ func externalListener(ch chan<- string) (net.Listener, error) {
 
 type Player struct {
 	opMu               sync.Mutex
+	prepareCancel      context.CancelFunc
+	loading            bool
+	playbackError      string
+	plexPlan           plexNextPlan
 	mu                 sync.Mutex
 	q                  Queue
 	paused             bool
@@ -2395,7 +2403,7 @@ func (p *Player) current() *Track {
 	return &t
 }
 func gaplessTrackSupported(t Track) bool {
-	if isHTTPURL(t.Path) {
+	if t.PlexKey != "" || strings.HasPrefix(t.Path, "plex:") || isHTTPURL(t.Path) {
 		return false
 	}
 	if strings.HasPrefix(t.Path, "cdda:") {
@@ -2516,7 +2524,23 @@ func (p *Player) playCurrentUnlocked() error {
 	p.stopped = false
 	p.basePosition = 0
 	p.gaplessQueuedIndex = -1
+	p.playbackError = ""
 	p.mu.Unlock()
+	go p.monitorNowPlaying(stop, generation)
+	if t.PlexKey != "" {
+		ctx, cancel := context.WithCancel(context.Background())
+		p.mu.Lock()
+		p.prepareCancel = cancel
+		p.loading = true
+		p.playbackError = ""
+		p.mu.Unlock()
+		runPlexWorker(func() { p.preparePlexTrack(ctx, t, idx, stop, generation, cfg) })
+		return nil
+	}
+	return p.startPreparedTrackUnlocked(t, idx, stop, generation, cfg)
+}
+
+func (p *Player) startPreparedTrackUnlocked(t Track, idx int, stop chan struct{}, generation uint64, cfg Config) error {
 	var err error
 	if strings.HasPrefix(t.Path, "cdda:") {
 		err = p.playCDTrack(t, stop)
@@ -2538,7 +2562,12 @@ func (p *Player) playCurrentUnlocked() error {
 		err = nativeAudioStartTrack(t, cfg.EQ)
 		if err == nil {
 			p.loadCurrentMetadata(idx, t)
-			if cur := p.current(); cur != nil {
+			if t.PlexKey != "" {
+				// Report this playback session using the configured scrobbling mode.
+				runPlexWorker(func() { p.plexSession(t, stop, generation) })
+				runPlexWorker(func() { p.plexArtwork(t, idx, stop, generation) })
+				runPlexWorker(func() { p.plexPrefetch(idx, t, stop, generation) })
+			} else if cur := p.current(); cur != nil {
 				lastfmTrackStarted(cfg.LastFM, cur.Artist, cur.Title, cur.Album, cur.Duration)
 			}
 		}
@@ -2546,7 +2575,10 @@ func (p *Player) playCurrentUnlocked() error {
 	if err != nil {
 		p.mu.Lock()
 		if p.stop == stop {
+			close(stop)
 			p.stop = nil
+			p.loading = false
+			p.playbackError = err.Error()
 			p.stopped = true
 		}
 		p.mu.Unlock()
@@ -2844,6 +2876,11 @@ func (p *Player) stopPlaybackRaw() {
 func (p *Player) stopPlaybackRawUnlocked() {
 	p.mu.Lock()
 	p.generation++
+	if p.prepareCancel != nil {
+		p.prepareCancel()
+		p.prepareCancel = nil
+	}
+	p.loading = false
 	cancel := p.streamCancel
 	p.streamCancel = nil
 	if p.stop != nil {
@@ -2859,6 +2896,7 @@ func (p *Player) stopPlaybackRawUnlocked() {
 		cancel()
 	}
 	nativeAudioStop()
+	clearNowPlaying()
 }
 func (p *Player) stopAndReset() {
 	p.opMu.Lock()
@@ -2916,19 +2954,12 @@ func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
 		p.mu.Unlock()
 		return
 	}
-	if p.q.Repeat && p.q.RepeatOne {
-	} else if p.q.Shuffle && len(p.q.Tracks) > 1 {
-		n := len(p.q.Tracks)
-		next := int(time.Now().UnixNano() % int64(n-1))
-		if next >= p.q.Index {
-			next++
-		}
+	if next := p.plexNextLocked(false); next >= 0 {
 		p.q.Index = next
-	} else if p.q.Index+1 < len(p.q.Tracks) {
-		p.q.Index++
-	} else if p.q.Repeat {
-		p.q.Index = 0
 	} else {
+		if p.stop != nil {
+			close(p.stop)
+		}
 		p.stop = nil
 		p.generation++
 		p.paused = false
@@ -2941,6 +2972,8 @@ func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
 			cancel()
 		}
 		nativeAudioStop()
+		clearNowPlaying()
+		lastfmTrackStopped(p.cfg.LastFM)
 		return
 	}
 	p.mu.Unlock()
@@ -2961,16 +2994,7 @@ func (p *Player) next() {
 	defer p.opMu.Unlock()
 	p.mu.Lock()
 	if len(p.q.Tracks) > 0 {
-		if p.q.Shuffle && len(p.q.Tracks) > 1 {
-			n := len(p.q.Tracks)
-			next := int(time.Now().UnixNano() % int64(n-1))
-			if next >= p.q.Index {
-				next++
-			}
-			p.q.Index = next
-		} else {
-			p.q.Index = (p.q.Index + 1) % len(p.q.Tracks)
-		}
+		p.q.Index = p.plexNextLocked(true)
 	}
 	p.mu.Unlock()
 	_ = p.playCurrentUnlocked()
@@ -3032,6 +3056,9 @@ func (p *Player) seekBy(seconds float64) {
 	}
 	t := p.q.Tracks[p.q.Index]
 	p.mu.Unlock()
+	if p.isLoading() {
+		return
+	}
 	target := p.elapsedNow().Seconds() + seconds
 	if target < 0 {
 		target = 0
@@ -3178,7 +3205,7 @@ func (a *App) startQueue(q Queue, origin *browseOrigin) error {
 		old := a.player
 		a.player = nil
 		a.origin = nil
-		old.stopPlaybackRaw()
+		old.stopAndReset()
 		closeQueueDirFD(&old.q)
 	}
 	reconnectRadio := origin != nil && origin.Kind == "radio"
@@ -4442,7 +4469,9 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 	if duration > 0 {
 		timeTxt += fmt.Sprintf(" / %02d:%02d", int(duration.Minutes()), int(duration.Seconds())%60)
 	}
-	if paused {
+	if p.isLoading() {
+		timeTxt = "DOWNLOADING PLEX TRACK..."
+	} else if paused {
 		timeTxt += "   PAUSED"
 	}
 	fb.text(l.rightX, l.timeY, timeScale, timeTxt, color.RGBA{185, 185, 190, 255})
@@ -4469,7 +4498,10 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 
 func playerTrackKey(p *Player) string {
 	t, _, idx, _, paused, rep, repOne, shuf, stopped := playerSnapshot(p)
-	return fmt.Sprintf("%d|%s|%s|%s|%s|%d|%d|%d|%.3f|%t|%t|%t|%t|%t",
+	p.mu.Lock()
+	detail := fmt.Sprintf("|%t|%s", p.loading, p.playbackError)
+	p.mu.Unlock()
+	return detail + fmt.Sprintf("%d|%s|%s|%s|%s|%d|%d|%d|%.3f|%t|%t|%t|%t|%t",
 		idx, t.Title, t.Artist, t.Album, t.MediaFormat, t.BitDepth, t.SampleRate, t.BitRate, t.Duration, t.Art != nil, paused, rep, repOne || shuf, stopped)
 }
 
@@ -4678,6 +4710,14 @@ func playerUI(app *App) {
 			drawPlayerDynamic(fb, p, l, sel, cfg)
 			fb.presentRegion(l.rightX-scaledPx(l.scale, 10), l.vizY-scaledPx(l.scale, 2), l.rightW+scaledPx(l.scale, 20), l.barY+l.barH-l.vizY+scaledPx(l.scale, 12))
 		case <-metaTick.C:
+			p.mu.Lock()
+			playbackError := p.playbackError
+			p.playbackError = ""
+			p.mu.Unlock()
+			if playbackError != "" {
+				message(app, "PLAYBACK ERROR", strings.ToUpper(playbackError))
+				lastTrackKey = ""
+			}
 			k := playerTrackKey(p)
 			if k != lastTrackKey {
 				l = drawPlayerStatic(fb, p, sel, cfg)
@@ -4685,6 +4725,9 @@ func playerUI(app *App) {
 				fb.present()
 				lastTrackKey = k
 				lastClock = clockText(cfg)
+				if _, _, _, _, _, _, _, _, stopped := playerSnapshot(p); !stopped {
+					p.publishCurrent()
+				}
 				continue
 			}
 			ct := clockText(cfg)
@@ -4701,13 +4744,14 @@ func eqUI(app *App) {
 	fb, acts, cfg := app.fb, app.acts, app.cfg
 	clockTick := time.NewTicker(30 * time.Second)
 	defer clockTick.Stop()
-	names := []string{"ENABLED", "BASS 60HZ", "LOW-MID 250HZ", "MID 1KHZ", "HIGH-MID 4KHZ", "TREBLE 12KHZ", "RESET FLAT"}
+	names := []string{"ENABLED", "PRESET", "BASS 60HZ", "LOW-MID 250HZ", "MID 1KHZ", "HIGH-MID 4KHZ", "TREBLE 12KHZ", "RESET FLAT"}
+	const rowPreset, rowReset = 1, 7
 	sel := 0
 	for {
 		fb.fill(appBackground(cfg))
 		drawTitle(fb, "EQUALIZER")
 		drawWebRemoteAddress(app)
-		vals := []string{onoff(cfg.EQ.Enabled), fmt.Sprintf("%+.1F DB", cfg.EQ.Bass), fmt.Sprintf("%+.1F DB", cfg.EQ.LowMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Mid), fmt.Sprintf("%+.1F DB", cfg.EQ.HighMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Treble), ""}
+		vals := []string{onoff(cfg.EQ.Enabled), eqPresetName(cfg.EQ), fmt.Sprintf("%+.1F DB", cfg.EQ.Bass), fmt.Sprintf("%+.1F DB", cfg.EQ.LowMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Mid), fmt.Sprintf("%+.1F DB", cfg.EQ.HighMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Treble), ""}
 		row := max(26, fb.h/11)
 		y := 70
 		for i, n := range names {
@@ -4763,13 +4807,23 @@ func eqUI(app *App) {
 		case actConfirm:
 			if sel == 0 {
 				cfg.EQ.Enabled = !cfg.EQ.Enabled
-			} else if sel == 6 {
+			} else if sel == rowPreset {
+				cycleEQPreset(&cfg.EQ, 1)
+			} else if sel == rowReset {
 				cfg.EQ = EQConfig{Enabled: cfg.EQ.Enabled}
 			}
 		case actLeft:
-			adjustEQ(&cfg.EQ, sel, -0.5)
+			if sel == rowPreset {
+				cycleEQPreset(&cfg.EQ, -1)
+			} else {
+				adjustEQ(&cfg.EQ, sel, -0.5)
+			}
 		case actRight:
-			adjustEQ(&cfg.EQ, sel, 0.5)
+			if sel == rowPreset {
+				cycleEQPreset(&cfg.EQ, 1)
+			} else {
+				adjustEQ(&cfg.EQ, sel, 0.5)
+			}
 		}
 		if app.player != nil {
 			app.player.cfg = *cfg
@@ -4780,17 +4834,67 @@ func eqUI(app *App) {
 func adjustEQ(e *EQConfig, i int, d float64) {
 	v := func(x *float64) { *x = math.Max(-6, math.Min(6, *x+d)) }
 	switch i {
-	case 1:
-		v(&e.Bass)
 	case 2:
-		v(&e.LowMid)
+		v(&e.Bass)
 	case 3:
-		v(&e.Mid)
+		v(&e.LowMid)
 	case 4:
-		v(&e.HighMid)
+		v(&e.Mid)
 	case 5:
+		v(&e.HighMid)
+	case 6:
 		v(&e.Treble)
 	}
+}
+
+type eqPreset struct {
+	Name                               string
+	Bass, LowMid, Mid, HighMid, Treble float64
+}
+
+// Gains in dB for the five bands (60 Hz, 250 Hz, 1 kHz, 4 kHz, 12 kHz), within the +-6 dB range.
+var eqPresets = []eqPreset{
+	{"FLAT", 0, 0, 0, 0, 0},
+	{"ROCK", 4, 2, -1.5, 2.5, 4},
+	{"DANCE", 5, 2.5, 0, 1.5, 3},
+	{"POP", -1, 2, 3, 1.5, -1},
+	{"JAZZ", 3, 1.5, -1.5, 1, 2.5},
+	{"CLASSICAL", 3, 1.5, -1, 1.5, 3},
+	{"HIP-HOP", 5, 3, -0.5, 1, 2},
+	{"VOCAL", -2, 0.5, 3, 2.5, 0.5},
+	{"ACOUSTIC", 2, 1.5, 0.5, 2, 2.5},
+	{"BASS BOOST", 6, 4, 0, 0, 0},
+	{"TREBLE BOOST", 0, 0, 0, 3, 6},
+}
+
+func eqPresetIndex(e EQConfig) int {
+	for i, p := range eqPresets {
+		if p.Bass == e.Bass && p.LowMid == e.LowMid && p.Mid == e.Mid && p.HighMid == e.HighMid && p.Treble == e.Treble {
+			return i
+		}
+	}
+	return -1
+}
+
+func eqPresetName(e EQConfig) string {
+	if i := eqPresetIndex(e); i >= 0 {
+		return eqPresets[i].Name
+	}
+	return "CUSTOM"
+}
+
+// cycleEQPreset steps to the next/previous preset and switches the equalizer on.
+func cycleEQPreset(e *EQConfig, dir int) {
+	n := len(eqPresets)
+	i := eqPresetIndex(*e)
+	if i < 0 {
+		i = -1
+		if dir < 0 {
+			i = n
+		}
+	}
+	p := eqPresets[((i+dir)%n+n)%n]
+	*e = EQConfig{Enabled: true, Bass: p.Bass, LowMid: p.LowMid, Mid: p.Mid, HighMid: p.HighMid, Treble: p.Treble}
 }
 func onoff(b bool) string {
 	if b {
@@ -5427,6 +5531,8 @@ func sourcesUI(app *App) {
 			items = append(items, "SMB")
 			types = append(types, "smb")
 		}
+		items = append(items, "PLEX")
+		types = append(types, "plex")
 		items = append(items, "ONLINE RADIO")
 		types = append(types, "radio")
 		items = append(items, "VIRTUAL CD")
@@ -5492,6 +5598,8 @@ func sourcesUI(app *App) {
 				continue
 			}
 			runBrowserSource(app, root, "smb")
+		case "plex":
+			plexUI(app)
 		case "radio":
 			onlineRadioUI(app)
 		case "virtualcd":
@@ -5572,7 +5680,10 @@ func main() {
 	webStop := make(chan struct{}, 1)
 	playerRefresh := make(chan struct{}, 1)
 	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg, webNowPlaying: webNowPlaying, webStop: webStop, playerRefresh: playerRefresh}
+	clearNowPlaying()
+	defer clearNowPlaying()
 	defer cleanupSMBMounts()
+	defer closePlexWorkers()
 	defer func() {
 		if app.player != nil {
 			app.player.stopPlaybackRaw()
