@@ -74,7 +74,7 @@ jobs:
       - name: Package MiSTer Hi-Fi
         run: |
           rm -f MiSTer_Hi-Fi.zip
-          zip -r MiSTer_Hi-Fi.zip Scripts -x '*/plex.json' '*/plex-client-id' '*/plex-*.tmp'
+          zip -r MiSTer_Hi-Fi.zip Scripts -x '*/plex.json' '*/plex-client-id' '*/plex-*.tmp' '*/config.json' '*/smb.json' '*/radio.json' '*/.settings-*.tmp'
 
       - name: Verify Release Package
         run: |

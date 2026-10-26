@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,11 @@ import (
 
 const version = "1.13.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
+
+var appConfigPath = filepath.Join(baseDir, "config.json")
+var smbConfigPath = filepath.Join(baseDir, "smb.json")
+var radioConfigPath = filepath.Join(baseDir, "radio.json")
+
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
 
@@ -883,7 +889,7 @@ func defaultConfig() Config {
 func loadConfig() Config {
 	c := defaultConfig()
 	_ = os.MkdirAll(baseDir, 0755)
-	path := filepath.Join(baseDir, "config.json")
+	path := appConfigPath
 	b, e := os.ReadFile(path)
 	if e != nil {
 		saveConfig(c)
@@ -932,7 +938,7 @@ func loadConfig() Config {
 func saveConfig(c Config) {
 	_ = os.MkdirAll(baseDir, 0755)
 	b, _ := json.MarshalIndent(c, "", "  ")
-	_ = os.WriteFile(filepath.Join(baseDir, "config.json"), b, 0644)
+	_ = atomicSettingsWrite(appConfigPath, b)
 }
 
 const customFontsDir = baseDir + "/fonts"
@@ -1028,7 +1034,7 @@ func cycleCustomFont(cfg *Config, fonts []customFontOption, dir int) {
 }
 func loadSMB() SMBConfig {
 	var c SMBConfig
-	b, e := os.ReadFile(filepath.Join(baseDir, "smb.json"))
+	b, e := os.ReadFile(smbConfigPath)
 	if e == nil {
 		_ = json.Unmarshal(b, &c)
 	}
@@ -1038,7 +1044,7 @@ func smbAvailable() bool { c := loadSMB(); return len(c.Shares) > 0 }
 
 func loadRadio() (RadioConfig, error) {
 	var c RadioConfig
-	b, err := os.ReadFile(filepath.Join(baseDir, "radio.json"))
+	b, err := os.ReadFile(radioConfigPath)
 	if err != nil {
 		return c, err
 	}
@@ -1140,12 +1146,16 @@ func cleanupSMBMounts() {
 	_ = os.Remove(smbMountRoot)
 }
 
-func mountShare(s SMBShare) (string, error) {
+func mountShare(s SMBShare) (string, error) { return mountShareContext(context.Background(), s) }
+func mountShareContext(ctx context.Context, s SMBShare) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	name := s.Name
 	if name == "" {
 		name = s.Server + "_" + s.Share
 	}
-	mountRoot := filepath.Join(smbMountRoot, sanitize(name))
+	identity := sha256.Sum256([]byte(s.Server + "\x00" + s.Share + "\x00" + s.Username + "\x00" + s.Password + fmt.Sprint(s.Guest)))
+	mountRoot := filepath.Join(smbMountRoot, fmt.Sprintf("%s-%x", sanitize(name), identity[:6]))
 	_ = os.MkdirAll(mountRoot, 0755)
 	if !isMounted(mountRoot) {
 		src := "//" + s.Server + "/" + s.Share
@@ -1153,7 +1163,25 @@ func mountShare(s SMBShare) (string, error) {
 		if s.Guest {
 			auth = append(auth, "guest")
 		} else {
-			auth = append(auth, "username="+s.Username, "password="+s.Password)
+			if _, helperErr := exec.LookPath("mount.cifs"); helperErr == nil {
+				credentials, err := os.CreateTemp("", "misterhifi-smb-*.credentials")
+				if err != nil {
+					return "", errors.New("cannot create SMB credentials")
+				}
+				defer os.Remove(credentials.Name())
+				_, err = fmt.Fprintf(credentials, "username=%s\npassword=%s\n", s.Username, s.Password)
+				closeErr := credentials.Close()
+				if err != nil || closeErr != nil {
+					return "", errors.New("cannot write SMB credentials")
+				}
+				auth = append(auth, "credentials="+credentials.Name())
+			} else {
+				if strings.ContainsAny(s.Username+s.Password, ",") {
+					return "", errors.New("SMB credentials containing commas require mount.cifs")
+				}
+				auth = append(auth, "username="+s.Username, "password="+s.Password)
+			}
+
 		}
 		attempts := [][]string{
 			append(append([]string{}, auth...), "vers=3.0"),
@@ -1176,7 +1204,10 @@ func mountShare(s SMBShare) (string, error) {
 		var last string
 		for _, mountSrc := range sources {
 			for _, opts := range attempts {
-				cmd := exec.Command("mount", "-t", "cifs", mountSrc, mountRoot, "-o", strings.Join(opts, ","))
+				if err := ctx.Err(); err != nil {
+					return "", errors.New("SMB connection timed out or was cancelled")
+				}
+				cmd := exec.CommandContext(ctx, "mount", "-t", "cifs", mountSrc, mountRoot, "-o", strings.Join(opts, ","))
 				out, err := cmd.CombinedOutput()
 				if err == nil || isMounted(mountRoot) {
 					if isMounted(mountRoot) && sameSMBSource(mountedSource(mountRoot), s.Server, s.Share) {
@@ -2965,6 +2996,7 @@ func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
 		p.paused = false
 		p.stopped = true
 		p.levels = [10]float64{}
+		cfg := p.cfg
 		cancel := p.streamCancel
 		p.streamCancel = nil
 		p.mu.Unlock()
@@ -2973,7 +3005,7 @@ func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
 		}
 		nativeAudioStop()
 		clearNowPlaying()
-		lastfmTrackStopped(p.cfg.LastFM)
+		lastfmTrackStopped(cfg.LastFM)
 		return
 	}
 	p.mu.Unlock()
@@ -3119,18 +3151,19 @@ type browseOrigin struct {
 }
 
 type App struct {
-	fb            *framebuffer
-	acts          <-chan action
-	external      <-chan string
-	cfg           *Config
-	player        *Player
-	origin        *browseOrigin
-	jumpSources   bool
-	webNowPlaying chan struct{}
-	webStop       chan struct{}
-	playerRefresh chan struct{}
-	webRemoteAddr string
-	virtualCD     *VirtualDisc
+	settingsRequests chan settingsTask
+	fb               *framebuffer
+	acts             <-chan action
+	external         <-chan string
+	cfg              *Config
+	player           *Player
+	origin           *browseOrigin
+	jumpSources      bool
+	webNowPlaying    chan struct{}
+	webStop          chan struct{}
+	playerRefresh    chan struct{}
+	webRemoteAddr    string
+	virtualCD        *VirtualDisc
 }
 
 func appBackground(cfg *Config) color.RGBA {
@@ -3294,6 +3327,7 @@ func (p *Player) restartCurrentFileAtPositionUnlocked(position float64, paused b
 		nativeAudioPause(true)
 	}
 	p.prepareGaplessNextFile()
+	go p.monitorNowPlaying(stop, generation)
 	go p.monitorPlayback(stop, generation)
 	return nil
 }
@@ -3695,10 +3729,17 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 		drawClock(fb, app.cfg, appBackground(app.cfg))
 		fb.present()
 		var a action
+	waitUIEvent:
 		select {
 		case <-clockTick.C:
 			continue
 		case a = <-acts:
+		case task := <-app.settingsRequests:
+			task.run()
+			if !task.redraw {
+				goto waitUIEvent
+			}
+			continue
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
 				playerUI(app)
@@ -4523,7 +4564,22 @@ func playerUI(app *App) {
 	defer vizTick.Stop()
 	defer metaTick.Stop()
 	for {
+	waitUIEvent:
 		select {
+		case task := <-app.settingsRequests:
+			task.run()
+			if !task.redraw {
+				goto waitUIEvent
+			}
+			if app.player == nil {
+				continue
+			}
+			p = app.player
+			l = drawPlayerStatic(fb, p, sel, cfg)
+			drawPlayerDynamic(fb, p, l, sel, cfg)
+			fb.present()
+			lastTrackKey = playerTrackKey(p)
+			continue
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
 				p = app.player
@@ -4679,7 +4735,9 @@ func playerUI(app *App) {
 					if app.jumpSources {
 						return
 					}
+					p.mu.Lock()
 					p.cfg = *cfg
+					p.mu.Unlock()
 					nativeAudioSetEQ(cfg.EQ)
 					fullRedraw = true
 				case 8:
@@ -4769,10 +4827,17 @@ func eqUI(app *App) {
 		drawClock(fb, cfg, appBackground(cfg))
 		fb.present()
 		var a action
+	waitUIEvent:
 		select {
 		case <-clockTick.C:
 			continue
 		case a = <-acts:
+		case task := <-app.settingsRequests:
+			task.run()
+			if !task.redraw {
+				goto waitUIEvent
+			}
+			continue
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
 				playerUI(app)
@@ -4826,7 +4891,9 @@ func eqUI(app *App) {
 			}
 		}
 		if app.player != nil {
+			app.player.mu.Lock()
 			app.player.cfg = *cfg
+			app.player.mu.Unlock()
 			nativeAudioSetEQ(cfg.EQ)
 		}
 	}
@@ -4915,10 +4982,17 @@ func message(app *App, title, msg string) {
 		drawClock(fb, app.cfg, appBackground(app.cfg))
 		fb.present()
 		var a action
+	waitUIEvent:
 		select {
 		case <-clockTick.C:
 			continue
 		case a = <-acts:
+		case task := <-app.settingsRequests:
+			task.run()
+			if !task.redraw {
+				goto waitUIEvent
+			}
+			continue
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
 				playerUI(app)
@@ -5128,6 +5202,7 @@ func confirmExitUI(app *App) bool {
 		drawClock(fb, app.cfg, bg)
 		fb.present()
 
+	waitUIEvent:
 		select {
 		case a := <-acts:
 			switch a {
@@ -5136,6 +5211,12 @@ func confirmExitUI(app *App) bool {
 			case actBack, actSources, actWake:
 				return false
 			}
+		case task := <-app.settingsRequests:
+			task.run()
+			if !task.redraw {
+				goto waitUIEvent
+			}
+			continue
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
 				playerUI(app)
@@ -5287,10 +5368,17 @@ func settingsUI(app *App) {
 		fb.present()
 
 		var a action
+	waitUIEvent:
 		select {
 		case <-clockTick.C:
 			continue
 		case a = <-acts:
+		case task := <-app.settingsRequests:
+			task.run()
+			if !task.redraw {
+				goto waitUIEvent
+			}
+			continue
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
 				playerUI(app)
@@ -5679,7 +5767,7 @@ func main() {
 	webNowPlaying := make(chan struct{}, 1)
 	webStop := make(chan struct{}, 1)
 	playerRefresh := make(chan struct{}, 1)
-	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg, webNowPlaying: webNowPlaying, webStop: webStop, playerRefresh: playerRefresh}
+	app := &App{settingsRequests: make(chan settingsTask), fb: fb, acts: acts, external: external, cfg: &cfg, webNowPlaying: webNowPlaying, webStop: webStop, playerRefresh: playerRefresh}
 	clearNowPlaying()
 	defer clearNowPlaying()
 	defer cleanupSMBMounts()

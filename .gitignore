@@ -12,3 +12,8 @@ third_party/libchdr/
 plex.json
 plex-client-id
 plex-*.tmp
+
+# User-managed source settings and atomic-save temporary files
+smb.json
+radio.json
+.settings-*.tmp
