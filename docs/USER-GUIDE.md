@@ -180,7 +180,7 @@ With gapless enabled, cached FLAC/WAV server tracks can transition without a gap
 
 Scrobbling modes are server-managed (`plex` for Plex, `server` for Jellyfin/Emby), `lastfm`, `listenbrainz`, `both` or `none`. **Both** means Hi-Fi submits to Last.fm and ListenBrainz; it does not mean server plus Hi-Fi.
 
-See [media-server configuration](MEDIASERVERS.md) for JSON fields and external target formats.
+See [Plex, Jellyfin and Emby setup](MEDIASERVERS.md) for step-by-step sign-in, browsing and troubleshooting instructions.
 
 ## Last.fm Scrobbling
 
@@ -625,7 +625,7 @@ Only MP2K-compatible GBA ROMs are supported; Game Boy and Game Boy Color playbac
 
 The source checks `games/GBA` on SD Card (`/media/fat`), CIFS (`/media/fat/cifs`) and USB drives (`/media/usb0` through `/media/usb7`). Available choices appear as CIFS, SD CARD and USB. One source opens directly. Multiple USB drives get a drive selector. Browsing preserves folders and filenames; other file types are visible but not playable. Dismissing an unsupported-game message returns to its folder with the same game highlighted.
 
-The engine tries to list music rather than sound effects: its preferred selection is looping songs with at least three tracks, with broader fallbacks for games that do not fit that pattern. This can omit short jingles or other valid music. No compatibility percentage is claimed for the entire GBA library. The [confirmed-game record](GBA-SUPPORTED.md) contains only named, verified playback results.
+The engine tries to list music rather than sound effects: its preferred selection is looping songs with at least three tracks, with broader fallbacks for games that do not fit that pattern. This can omit short jingles or other valid music. GBA Music supports an estimated 40% of the GBA library. Unsupported ROMs display an error message.
 
 ### GBA preparation and duration
 

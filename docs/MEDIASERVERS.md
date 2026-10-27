@@ -1,88 +1,94 @@
-# Media servers
+# Plex, Jellyfin and Emby
 
-Hi-Fi can browse and stream from music servers. Plex, Jellyfin and Emby are built in;
-the code that does everything else (menus, the web remote, the track cache,
-playback reports, prefetching, `<id>://` targets for NFC tags) does not depend
-on which server it is. A server only implements two small interfaces.
+Connect MiSTer Hi-Fi to your music server to browse artists, albums, recently added music and playlists. Setup is easiest from a phone or computer on the same network as your MiSTer.
 
-A server **shows up in the sources menu and the web remote only when its config
-file exists** (`<id>.json` in `/media/fat/Scripts/.config/MiSTerHiFi/`).
+## Open Source Settings
 
-## Using one
+1. Start MiSTer Hi-Fi.
+2. Open `http://YOUR-MISTER-IP:8182` in your browser.
+3. Open **Settings > Source Settings**.
+4. Choose **Plex**, **Jellyfin** or **Emby**.
 
-Set a server up in the web remote: Settings > Source Settings (a tab per
-server, with a connection test), or write the config file by hand.
+Use your server's local address, including its port. For example, a Jellyfin or Emby server might use `http://192.168.1.100:8096`; Plex commonly uses `http://192.168.1.100:32400`. Replace the example address with your own server's address.
 
-`plex.json` (see `plex.example.json`): `server`, `token`, optional `library`
-(section id; the first music library by default), `insecure` (skip TLS checks,
-for a self-signed certificate), `scrobbling` (`plex`: the server counts, for a
-scrobbler that follows Plex; `lastfm`, `listenbrainz` or `both`: Hi-Fi's own,
-with the Last.fm / ListenBrainz settings of `config.json`; `none`) and `max_track_mb`.
+## Plex
 
-`jellyfin.json` (see `jellyfin.example.json`): only `server` is needed. Sign in
-with Quick Connect: in the web settings (the page shows a code), from the
-sources menu on the MiSTer (the screen shows a code), or from a shell,
-`mister_hifi --jellyfin-login http://host:8096`; then in Jellyfin open your
-profile, Quick Connect, and enter the code. Hi-Fi stores the token and user id
-it gets (no password). Same optional keys as Plex, with `scrobbling` `server`
-(Jellyfin keeps the history), `lastfm`, `listenbrainz`, `both` or `none`, and `library` (the library id).
+1. Enter your **Server URL**.
+2. Enter your **X-Plex-Token**. This is an access token for your Plex account, not your password.
+3. Leave **Music library ID** blank to use the first music library, or enter the ID of the library you want.
+4. Save the settings and use the connection test.
 
-`emby.json` (see `emby.example.json`): the same keys as Jellyfin's. Emby is the
-same code as Jellyfin (`jellyfin.go`: `JellyfinConfig.emby` and
-`jellyfinServer.emby` switch the differences: the `/emby` path prefix, the
-`X-Emby-*` headers, the item queries under `/Users/<id>/`, numeric item ids, a
-`PlaySessionId` on playback reports). Emby has no Quick Connect: sign in with a
-user name and password, in the web settings (Emby tab) or from a shell,
-`mister_hifi --emby-login http://host:8096 <user>` (asks for the password).
-Only the token and user id are stored, never the password. Tested against Emby 4.10.
+MiSTer Hi-Fi does not provide a Plex account sign-in screen. If you need help obtaining your token, follow Plex's [token instructions](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/). Treat the token like a password.
 
-Command line / NFC targets: `plex://album/<id>`, `plex://playlist/<id>`,
-`plex://search/<text>` and the same for `jellyfin://` and `emby://`.
+When editing the same server later, leaving the token field blank keeps its saved value.
 
-## Gapless
+## Jellyfin
 
-With the *Gapless playback* setting on, a track from a server is queued in the audio engine as soon as the
-prefetch has the next one in the cache (`srvPrefetch`, then `prepareGaplessNextFile`), and the engine moves on
-without a gap (`handleGaplessTransitionUnlocked` then starts the reporting, cover and prefetch of the new
-track). Only FLAC and WAV are queued, as with local files (`gaplessTrackSupported`); shuffle works too, the queued
-track is the one of the prefetch's plan; Repeat One does not queue. A track that is not cached yet when the current one
-ends is simply fetched and started as before.
+1. Enter your **Server URL** and save it.
+2. Start **Quick Connect** in the Jellyfin settings page.
+3. In Jellyfin, open your account's **Quick Connect** page and approve the displayed code.
+4. Wait for Hi-Fi to show that you are signed in, then test the connection.
 
-## Adding one
+Quick Connect must be available on your Jellyfin server. Hi-Fi saves the issued access token, so you do not need to approve the code every time you listen.
 
-1. `yourserver.go`: implement `mediaServer` and `mediaSession` (`mediaserver.go`,
-   documented there). `Connect(ctx)` validates the config and returns an immutable
-   session (a snapshot: queued tracks keep playing from it if the config changes).
-   A session lists artists, albums and playlists, returns `Track`s (set `SrvKey`
-   and `SrvPart`; optionally `SrvExt`, `SrvThumb`, `Number`, ...), opens a track's
-   file, fetches its cover, reports playback, and says who scrobbles
-   (`Scrobbling`), how big a track may be (`MaxTrackBytes`), what an item id looks
-   like (`ValidID`: ids go into URL paths) and what keeps cached files apart
-   (`CacheKey`). Every network call takes the context, which ends when the track
-   stops: use it. Return `errNotSignedIn` from `Connect` and implement
-   `mediaServerLogin` if it can sign in from the screen.
+You can also start the Quick Connect sign-in from the Jellyfin source on the MiSTer screen.
 
-   What the generic code gives you for free: the cache with its size limit and
-   cancellation, the counted background workers, reports with listen time,
-   prefetching the next track (also with shuffle), the "downloading" state, the
-   menus, the web remote tree and the `<id>://` targets.
-2. Add it to `mediaServers` in `mediaserver.go`.
-3. Add `yourserver.example.json`.
-4. Test it against a fake server like `mediaserver_test.go` does (`newFakeJellyfin`); the
-   behaviour of the generic part is covered by `plex_integration_test.go`.
-5. For the web settings, add a form like `jellyfinForm` in `web_settings_ui.go` and a handler like
-   `jellyfin_web.go` (config, and a sign-in if the server has one).
+## Emby
 
-`plex.go` is the smaller example, `jellyfin.go` the one with a sign-in flow.
-Servers that speak the Subsonic API (Navidrome, Airsonic, ...) fit the same
-shape and would be a good next one.
+1. Enter your **Server URL** and save it.
+2. Enter your Emby **username and password** in the sign-in form.
+3. Sign in, then test the connection.
 
-## Testing
+Hi-Fi saves the access token and user ID returned by Emby, rather than storing the password you entered. Emby does not use the Jellyfin Quick Connect flow.
 
-`go test .` runs everything against fake servers (no network, no hardware):
+## Browse and play
 
-    CC=gcc CGO_ENABLED=0 go test .
+Once configured, the server appears in the source list on the MiSTer and in the Web Remote.
 
-`emby_live_test.go` runs against a real Emby server (read-only apart from one playback report) when
-`HIFI_LIVE_EMBY_SERVER`, `HIFI_LIVE_EMBY_USER` and `HIFI_LIVE_EMBY_PASS` are set; `./build.sh test` passes
-`HIFI_LIVE_*` variables on to its container.
+1. Open the server source.
+2. Choose artists, albums, recently added albums or playlists.
+3. Open an album or playlist and select a song.
+
+Playback starts from the selected song. The player shows the title, artist, album and artwork when available. Plex's recently added view shows up to 100 albums.
+
+A server can appear in the source list even while it is offline; opening it may then show a connection error.
+
+## Loading and playback
+
+Hi-Fi downloads the selected song's original file to temporary storage before playback. There is no server-side transcoding. Longer or larger files can take more time to prepare, especially over a slow connection.
+
+The next song is downloaded in advance where possible. **Stop** or **Next** cancels a pending download. M4A music can contain AAC-LC or Apple Lossless (ALAC) audio.
+
+**Gapless playback** is optional and experimental. Enable it under **Settings > Experimental**. It works with cached FLAC and WAV songs from these servers. If the next song has not finished downloading, playback waits for it instead. MP3 and M4A do not use this gapless path.
+
+## Playback history and scrobbling
+
+Choose the scrobbling option in the server's source settings:
+
+| Option | What it does |
+| --- | --- |
+| Server / Plex | Uses the music server's own playback-history handling. |
+| Last.fm | Lets Hi-Fi submit listens to Last.fm. Configure Last.fm first in App Settings. |
+| ListenBrainz | Lets Hi-Fi submit listens to ListenBrainz. Add your user token in App Settings first. |
+| Both | Lets Hi-Fi submit to Last.fm and ListenBrainz. |
+| None | Disables the selected scrobbling submission. Playback status may still be reported to the server. |
+
+Choosing Last.fm or ListenBrainz does not set up those accounts automatically. See the [scrobbling instructions](USER-GUIDE.md#lastfm-scrobbling).
+
+## Other source options
+
+- **Music library ID:** choose a specific library when your server has more than one. Leave it blank to use the default music-library selection.
+- **Maximum track size:** limits each downloaded song, not your whole library. Raise it if a large lossless file exceeds the limit, provided your MiSTer has enough temporary storage.
+- **Allow insecure TLS:** skips certificate verification for servers using a self-signed certificate. Leave this off unless your server needs it.
+
+Changing the server address clears the saved login associated with the previous address. Sign in again or supply the token for the new server.
+
+## If it does not connect
+
+- Check that the server is running and its address includes the correct port.
+- Confirm that your MiSTer can reach it on the network.
+- Use the source's connection test to see the reported error.
+- For Plex, check the token and selected library.
+- For Jellyfin, check Quick Connect availability and approve a fresh code if necessary.
+- For Emby, sign in again and check that the account can access the music library.
+- If only one song fails, check its format, file size and the server's access permissions.

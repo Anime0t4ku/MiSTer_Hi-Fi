@@ -89,7 +89,7 @@ It looks for `games/GBA` on:
 
 Only available storage options appear. A single option opens directly; multiple USB drives get a drive selector. Folders and filenames are preserved. Open a `.gba` or `.zip` game, then select a song. Other files remain visible but cannot be played.
 
-Only games supported by the MP2K music engine can play. An unsupported game shows a message, then returns to the file list with the game still selected. See the [confirmed-game record](docs/GBA-SUPPORTED.md); it currently contains no named confirmations.
+GBA Music supports an estimated **40% of the GBA library** through the MP2K music engine. Unsupported ROMs display an error message; closing it returns to the file list with the same game highlighted.
 
 Each song is prepared before playback. The screen shows prepared audio time and elapsed waiting time. Once ready, its measured duration, seeking and visualizer work through the normal audio player. Preparation can be cancelled with Stop or by choosing another song.
 
@@ -129,7 +129,10 @@ chmod +x build-mister.sh fetch_miniaudio.sh fetch_libchdr.sh build_agbplay.sh fe
 
 The result is `Scripts/.config/MiSTerHiFi/mister_hifi`. Build prerequisites and dependency details are in the [user guide](docs/USER-GUIDE.md#building).
 
-## License
+## Credits and license
+
+**Developer:** Anime0t4ku  
+**Contributor:** Phoenix
 
 MiSTer Hi-Fi's own code is licensed under **GPLv3**. Third-party components retain their own licenses; see [dependencies and licenses](docs/USER-GUIDE.md#dependencies-and-licenses).
 
