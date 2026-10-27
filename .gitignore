@@ -7,6 +7,7 @@ Scripts/.config/MiSTerHiFi/config.json
 stb_vorbis.h
 
 third_party/libchdr/
+third_party/agbplay-src/
 
 # Plex credentials and generated per-device identity
 plex.json

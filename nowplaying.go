@@ -36,6 +36,11 @@ func publishNowPlaying(t Track) { _ = publishNowPlayingState(t, "playing", 0, t.
 func publishNowPlayingState(t Track, state string, position, duration float64) error {
 	nowPlayingState.Lock()
 	defer nowPlayingState.Unlock()
+	// Online Radio: the Monitor shows the station (name + logo); the song and
+	// its cover stay on Hi-Fi's own screen.
+	if t.RadioName != "" {
+		t.Artist, t.Album, t.Art = "", t.RadioName, t.RadioLogo
+	}
 	hasCover := t.Art != nil
 	artKey := fmt.Sprintf("%s\x00%s\x00%s\x00%p", t.Path, t.Artist, t.Album, t.Art)
 	if hasCover && nowPlayingState.artKey != artKey {

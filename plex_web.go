@@ -1,166 +1,15 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
-func plexID(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// Virtual paths contain only category names and Plex numeric IDs, never URLs.
-func plexBrowse(ctx context.Context, cfg PlexConfig, folder string) ([]webEntry, []Track, error) {
-	folder = path.Clean("/" + folder)
-	if folder == "/" {
-		return []webEntry{{Name: "Artists", Path: "/artists", IsDir: true}, {Name: "Albums", Path: "/albums", IsDir: true}, {Name: "Recently added", Path: "/recent", IsDir: true}, {Name: "Playlists", Path: "/playlists", IsDir: true}}, nil, nil
-	}
-	parts := strings.Split(strings.Trim(folder, "/"), "/")
-	for _, id := range parts[1:] {
-		if !plexID(id) {
-			return nil, nil, errors.New("invalid Plex path")
-		}
-	}
-	var endpoint string
-	q := url.Values{}
-	limit := 0
-	trackList := false
-	artistLabel := false
-	section := func() (string, error) {
-		if cfg.Library != "" {
-			return cfg.Library, nil
-		}
-		list, err := cfg.listContext(ctx, "/library/sections", nil, 0)
-		if err != nil {
-			return "", err
-		}
-		for _, s := range list {
-			if s.Type == "artist" {
-				return s.Key, nil
-			}
-		}
-		return "", errors.New("no Plex music library")
-	}
-	switch parts[0] {
-	case "artists":
-		if len(parts) == 1 {
-			sec, err := section()
-			if err != nil {
-				return nil, nil, err
-			}
-			endpoint = "/library/sections/" + sec + "/all"
-			q.Set("type", "8")
-			q.Set("sort", "titleSort")
-		} else if len(parts) == 2 {
-			endpoint = "/library/metadata/" + parts[1] + "/children"
-		} else if len(parts) == 3 {
-			endpoint = "/library/metadata/" + parts[2] + "/children"
-			trackList = true
-		}
-	case "albums", "recent":
-		if len(parts) == 1 {
-			sec, err := section()
-			if err != nil {
-				return nil, nil, err
-			}
-			endpoint = "/library/sections/" + sec + "/all"
-			q.Set("type", "9")
-			q.Set("sort", "artist.titleSort,titleSort")
-			artistLabel = true
-			if parts[0] == "recent" {
-				q.Set("sort", "addedAt:desc")
-				limit = 100
-			}
-		} else if len(parts) == 2 {
-			endpoint = "/library/metadata/" + parts[1] + "/children"
-			trackList = true
-		}
-	case "playlists":
-		if len(parts) == 1 {
-			endpoint = "/playlists"
-			q.Set("playlistType", "audio")
-		} else if len(parts) == 2 {
-			endpoint = "/playlists/" + parts[1] + "/items"
-			trackList = true
-		}
-	}
-	if endpoint == "" {
-		return nil, nil, errors.New("invalid Plex path")
-	}
-	metas, err := cfg.listContext(ctx, endpoint, q, limit)
-	if err != nil {
-		return nil, nil, err
-	}
-	entries := make([]webEntry, 0, len(metas))
-	tracks := make([]Track, 0, len(metas))
-	for _, m := range metas {
-		if trackList {
-			t := plexTrack(m)
-			t.PlexSource = &cfg
-			if t.PlexPart == "" {
-				continue
-			}
-			name := t.Title
-			if parts[0] == "playlists" && t.Artist != "" {
-				name = t.Artist + " - " + name
-			} else if m.Index > 0 {
-				name = fmt.Sprintf("%02d  %s", m.Index, name)
-			}
-			entries = append(entries, webEntry{Name: name, Path: folder + "/track/" + strconv.Itoa(len(tracks))})
-			tracks = append(tracks, t)
-		} else {
-			if !plexID(m.RatingKey) {
-				continue
-			}
-			name := m.Title
-			if artistLabel && m.ParentTitle != "" {
-				name = m.ParentTitle + " - " + name
-			}
-			entries = append(entries, webEntry{Name: name, Path: folder + "/" + m.RatingKey, IsDir: true})
-		}
-	}
-	return entries, tracks, nil
-}
-func plexWebQueue(ctx context.Context, selected string) (Queue, error) {
-	cfg, err := loadPlex()
-	if err != nil {
-		return Queue{}, err
-	}
-	i := strings.LastIndex(selected, "/track/")
-	if i < 0 {
-		return Queue{}, errors.New("invalid Plex track")
-	}
-	index, err := strconv.Atoi(selected[i+7:])
-	if err != nil {
-		return Queue{}, errors.New("invalid Plex track")
-	}
-	_, tracks, err := plexBrowse(ctx, cfg, selected[:i])
-	if err != nil {
-		return Queue{}, err
-	}
-	if index < 0 || index >= len(tracks) {
-		return Queue{}, errors.New("Plex track unavailable")
-	}
-	return Queue{Tracks: tracks, Index: index}, nil
-}
 func (w *webRemote) handlePlexConfig(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -206,7 +55,7 @@ func (w *webRemote) handlePlexConfig(rw http.ResponseWriter, r *http.Request) {
 		if cfg.Scrobbling == "" {
 			cfg.Scrobbling = "plex"
 		}
-		if cfg.Scrobbling != "plex" && cfg.Scrobbling != "lastfm" && cfg.Scrobbling != "none" {
+		if cfg.Scrobbling != "plex" && !isOwnScrobbleMode(cfg.Scrobbling) && cfg.Scrobbling != "none" {
 			http.Error(rw, "invalid scrobbling mode", 400)
 			return
 		}

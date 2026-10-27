@@ -39,31 +39,34 @@ type webRemote struct {
 }
 
 type webState struct {
-	Connected   bool    `json:"connected"`
-	Version     string  `json:"version"`
-	Error       string  `json:"error,omitempty"`
-	State       string  `json:"state"`
-	Title       string  `json:"title"`
-	Artist      string  `json:"artist"`
-	Album       string  `json:"album"`
-	Format      string  `json:"format"`
-	Position    float64 `json:"position"`
-	Duration    float64 `json:"duration"`
-	QueueIndex  int     `json:"queue_index"`
-	QueueLength int     `json:"queue_length"`
-	Shuffle     bool    `json:"shuffle"`
-	Loop        bool    `json:"loop"`
-	LoopMode    string  `json:"loop_mode"`
-	Volume      int     `json:"volume"`
-	Muted       bool    `json:"muted"`
-	HasArt      bool    `json:"has_art"`
-	ArtKey      string  `json:"art_key"`
+	LoadingMessage string  `json:"loading_message,omitempty"`
+	Connected      bool    `json:"connected"`
+	Version        string  `json:"version"`
+	Error          string  `json:"error,omitempty"`
+	State          string  `json:"state"`
+	Title          string  `json:"title"`
+	Artist         string  `json:"artist"`
+	Album          string  `json:"album"`
+	Format         string  `json:"format"`
+	Position       float64 `json:"position"`
+	Duration       float64 `json:"duration"`
+	QueueIndex     int     `json:"queue_index"`
+	QueueLength    int     `json:"queue_length"`
+	Shuffle        bool    `json:"shuffle"`
+	Loop           bool    `json:"loop"`
+	LoopMode       string  `json:"loop_mode"`
+	Volume         int     `json:"volume"`
+	Muted          bool    `json:"muted"`
+	HasArt         bool    `json:"has_art"`
+	ArtKey         string  `json:"art_key"`
 }
 
 type webEntry struct {
-	Name  string `json:"name"`
-	Path  string `json:"path"`
-	IsDir bool   `json:"is_dir"`
+	Kind     string `json:"kind,omitempty"`
+	Disabled bool   `json:"disabled,omitempty"`
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	IsDir    bool   `json:"is_dir"`
 }
 
 type webSource struct {
@@ -183,6 +186,10 @@ func startWebRemote(app *App) *webRemote {
 	mux.HandleFunc("/api/state", w.handleState)
 	mux.HandleFunc("/api/sources", w.handleSources)
 	mux.HandleFunc("/api/plex/config", w.handlePlexConfig)
+	mux.HandleFunc("/api/jellyfin/config", w.handleJellyfinConfig)
+	mux.HandleFunc("/api/jellyfin/quickconnect", w.handleJellyfinQuickConnect)
+	mux.HandleFunc("/api/emby/config", w.handleEmbyConfig)
+	mux.HandleFunc("/api/emby/signin", w.handleEmbySignIn)
 	registerWebSettings(mux, w)
 	mux.HandleFunc("/api/browse", w.handleBrowse)
 	mux.HandleFunc("/api/play", w.handlePlay)
@@ -265,6 +272,11 @@ func (w *webRemote) stateOnUI() webState {
 	p.mu.Unlock()
 	if loading {
 		s.State = "loading"
+		title, detail := p.preparationStatus()
+		s.LoadingMessage = title
+		if detail != "" {
+			s.LoadingMessage += " " + detail
+		}
 	}
 	s.Title = t.Title
 	if s.Title == "" && t.Path != "" {
@@ -313,7 +325,14 @@ func (w *webRemote) handleIndex(rw http.ResponseWriter, r *http.Request) {
 func (w *webRemote) handleState(rw http.ResponseWriter, r *http.Request) { writeJSON(rw, w.state()) }
 
 func (w *webRemote) handleSources(rw http.ResponseWriter, r *http.Request) {
-	out := []webSource{{ID: "sd", Name: "SD Card"}, {ID: "plex", Name: "Plex"}}
+	out := []webSource{{ID: "sd", Name: "SD Card"}}
+	if enabled, err := w.gbaWebEnabled(r.Context()); err == nil && enabled && gameBoyAvailable() {
+		out = append(out, webSource{ID: "gba", Name: "GBA Music (Experimental)"})
+	}
+	// only servers that are set up show up (Settings > Source Settings sets them up)
+	for _, srv := range configuredMediaServers() {
+		out = append(out, webSource{ID: srv.ID(), Name: strings.Title(strings.ToLower(srv.Label()))})
+	}
 	for i := range detectUSB() {
 		out = append(out, webSource{ID: fmt.Sprintf("usb:%d", i), Name: fmt.Sprintf("USB %d", i+1)})
 	}
@@ -370,17 +389,21 @@ func safeWithin(root, path string) (string, error) {
 
 func (w *webRemote) handleBrowse(rw http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("source")
-	if id == "plex" {
-		cfg, err := loadPlex()
+	if id == "gba" {
+		w.handleGBABrowse(rw, r)
+		return
+	}
+	if srv := configuredServerByID(id); srv != nil {
+		sess, err := srv.Connect(r.Context())
 		if err != nil {
-			http.Error(rw, "Configure Plex in Settings > Source Settings > Plex. "+err.Error(), 400)
+			http.Error(rw, err.Error(), 502)
 			return
 		}
 		folder := r.URL.Query().Get("path")
 		if folder == "" {
 			folder = "/"
 		}
-		entries, _, err := plexBrowse(r.Context(), cfg, folder)
+		entries, _, err := srvWebBrowse(r.Context(), sess, srv.Label(), folder)
 		if err != nil {
 			http.Error(rw, err.Error(), 502)
 			return
@@ -407,7 +430,7 @@ func (w *webRemote) handleBrowse(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, "no optical drive", 404)
 			return
 		}
-		tracks, err := readCDTOC(devs[0])
+		tracks, err := readCDTOCWithMetadata(devs[0])
 		if err != nil {
 			http.Error(rw, err.Error(), 500)
 			return
@@ -472,14 +495,30 @@ func (w *webRemote) handlePlay(rw http.ResponseWriter, r *http.Request) {
 	defer w.opMu.Unlock()
 	var q Queue
 	var origin *browseOrigin
-	if req.Source == "plex" {
-		var err error
-		q, err = plexWebQueue(r.Context(), req.Path)
+	if req.Source == "gba" {
+		enabled, err := w.gbaWebEnabled(r.Context())
+		if err != nil {
+			http.Error(rw, err.Error(), 503)
+			return
+		}
+		if !enabled {
+			http.Error(rw, "GBA Music is disabled", 403)
+			return
+		}
+		q, err = gbaWebQueue(req.Path)
 		if err != nil {
 			http.Error(rw, err.Error(), 400)
 			return
 		}
-		origin = &browseOrigin{Kind: "plex", Selected: q.Tracks[q.Index].Title}
+		origin = &browseOrigin{Kind: "gameboy", Selected: q.Tracks[q.Index].Title}
+	} else if srv := configuredServerByID(req.Source); srv != nil {
+		var err error
+		q, err = srvWebQueue(r.Context(), srv, req.Path)
+		if err != nil {
+			http.Error(rw, err.Error(), 400)
+			return
+		}
+		origin = &browseOrigin{Kind: srv.ID(), Selected: q.Tracks[q.Index].Title}
 	} else if req.Source == "radio" {
 		i, e := strconv.Atoi(strings.TrimPrefix(req.Path, "radio:"))
 		cfg, ce := loadRadio()
@@ -488,7 +527,7 @@ func (w *webRemote) handlePlay(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s := cfg.Stations[i]
-		q = Queue{Tracks: []Track{{Path: s.URL, Title: s.Name, Album: "Online Radio", MediaFormat: "STREAM", DirFD: -1}}}
+		q = Queue{Tracks: []Track{radioStationTrack(s)}}
 		origin = &browseOrigin{Kind: "radio", Selected: s.Name}
 	} else if req.Source == "disc" {
 		i, e := strconv.Atoi(strings.TrimPrefix(req.Path, "disc:"))
@@ -497,7 +536,7 @@ func (w *webRemote) handlePlay(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, "disc unavailable", 400)
 			return
 		}
-		tracks, e := readCDTOC(devs[0])
+		tracks, e := readCDTOCWithMetadata(devs[0])
 		if e != nil || i < 0 || i >= len(tracks) {
 			http.Error(rw, "track unavailable", 400)
 			return
@@ -842,9 +881,9 @@ const webRemoteHTML = `<!doctype html><html><head><meta charset="utf-8"><meta na
 </style></head><body><div class="top">MISTER HI-FI<button id="settingsOpen" class="settings-open" type="button">Settings</button><span id="dot" class="dot"></span></div><div class="layout"><section id="browser" class="browser"><div class="sources" id="sources"></div><div class="path" id="path">Select a source</div><div class="list" id="list"><div class="empty">Choose a source to browse music.</div></div></section><section id="player" class="player"><img id="art" class="art" alt="Album art"><div class="meta"><div id="title" class="title">Nothing playing</div><div id="artist" class="artist"></div><div id="album" class="album"></div></div><div class="progress"><input id="seek" type="range" min="0" max="1000" value="0"><div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div></div><div class="controls"><button onclick="control('previous')" aria-label="Previous"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="2.5" height="16"/><path d="M19.5 4v16L7 12z"/></svg></button><button id="play" class="main" onclick="control('playpause')">▶</button><button onclick="control('next')" aria-label="Next"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 4v16L17 12z"/><rect x="18.5" y="4" width="2.5" height="16"/></svg></button><button onclick="control('stop')">■</button></div><div class="volume"><button id="mute" onclick="toggleMute()" aria-label="Mute">🔊</button><div class="volrow"><input id="volume" type="range" min="0" max="100" value="100" aria-label="Volume"><span id="volpct" class="volpct">100%</span></div><span></span></div><div class="toggles"><button id="shuffle" onclick="control('shuffle')">Shuffle</button><button id="loop" onclick="control('loop')">Loop</button></div><div class="status" id="status">Connecting…</div></section></div><div class="mobile-tabs"><button onclick="tab('player')">Now Playing</button><button onclick="tab('browser')">Browse</button></div><script>
 let currentSource='', currentPath='', rootPath='', state=null, dragging=false, volumeDragging=false, ws=null, artKey=''; const $=id=>document.getElementById(id); function fmt(v){v=Math.max(0,Math.floor(v||0));return Math.floor(v/60)+':'+String(v%60).padStart(2,'0')} function tab(x){$('browser').classList.toggle('hidden',x!=='browser');$('player').classList.toggle('hidden',x!=='player')}
 async function api(path,opt){const r=await fetch(path,opt);if(!r.ok)throw new Error(await r.text());return r.headers.get('content-type')?.includes('json')?r.json():r.text()} async function sources(){const a=await api('/api/sources');$('sources').innerHTML='';a.forEach(s=>{let b=document.createElement('button');b.className='chip';b.textContent=s.name;b.onclick=()=>openSource(s.id,b);$('sources').appendChild(b)})}
-async function openSource(id,b){currentSource=id;currentPath='';document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));b?.classList.add('active');await browse('')} async function browse(path){try{const d=await api('/api/browse?source='+encodeURIComponent(currentSource)+'&path='+encodeURIComponent(path||''));currentPath=d.path||'';rootPath=d.root||'';$('path').textContent=currentPath||currentSource;const l=$('list');l.innerHTML='';if(currentPath&&rootPath&&currentPath!==rootPath){let up=document.createElement('button');up.className='entry';up.innerHTML='<span>..</span><span class="kind">Folder</span>';up.onclick=()=>browse(currentPath.substring(0,currentPath.lastIndexOf('/'))||rootPath);l.appendChild(up)}d.entries.forEach(e=>{let x=document.createElement('button');x.className='entry';x.innerHTML='<span>'+escapeHtml(e.name)+'</span><span class="kind">'+(e.is_dir?'Folder':'Track')+'</span>';x.onclick=()=>e.is_dir?browse(e.path):play(e.path);l.appendChild(x)});if(!d.entries.length){let empty=document.createElement('div');empty.className='empty';empty.textContent='No playable items found.';l.appendChild(empty)}}catch(e){$('list').innerHTML='<div class="empty">'+escapeHtml(String(e.message||e))+'</div>'}}
+async function openSource(id,b){currentSource=id;currentPath='';document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));b?.classList.add('active');await browse('')} async function browse(path){try{const d=await api('/api/browse?source='+encodeURIComponent(currentSource)+'&path='+encodeURIComponent(path||''));currentPath=d.path||'';rootPath=d.root||'';$('path').textContent=currentPath||currentSource;const l=$('list');l.innerHTML='';if(currentPath&&rootPath&&currentPath!==rootPath){let up=document.createElement('button');up.className='entry';up.innerHTML='<span>..</span><span class="kind">Folder</span>';up.onclick=()=>browse(d.parent||currentPath.substring(0,currentPath.lastIndexOf('/'))||rootPath);l.appendChild(up)}d.entries.forEach(e=>{let x=document.createElement('button');x.className='entry';x.innerHTML='<span>'+escapeHtml(e.name)+'</span><span class="kind">'+escapeHtml(e.kind||(e.is_dir?'Folder':'Track'))+'</span>';x.disabled=!!e.disabled;x.onclick=()=>e.is_dir?browse(e.path):play(e.path);l.appendChild(x)});if(!d.entries.length){let empty=document.createElement('div');empty.className='empty';empty.textContent='No playable items found.';l.appendChild(empty)}}catch(e){$('list').innerHTML='<div class="empty">'+escapeHtml(String(e.message||e))+'</div>'}}
 async function play(path){try{await api('/api/play',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:currentSource,path})});if(innerWidth<=760)tab('player')}catch(e){$('status').textContent=e.message}} async function control(action){await api('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})})}
-function render(s){state=s;$('dot').classList.toggle('on',s.connected);$('status').textContent=s.error||(s.state==='loading'?'Downloading Plex track…':s.connected?'Connected to MiSTer Hi-Fi':'Disconnected from MiSTer Hi-Fi');$('title').textContent=s.title||'Nothing playing';$('artist').textContent=s.artist||'';$('album').textContent=s.album||'';$('play').textContent=s.state==='playing'?'❚❚':'▶';$('shuffle').classList.toggle('active',s.shuffle);$('loop').classList.toggle('active',s.loop);$('loop').textContent=s.loop_mode==='one'?'Loop 1':'Loop';$('loop').classList.toggle('active',s.loop_mode!=='off');if(!volumeDragging){$('volume').value=s.volume??100;$('volpct').textContent=(s.volume??100)+'%'}$('mute').textContent=s.muted?'🔇':'🔊';$('mute').classList.toggle('active',!!s.muted);if(!dragging){$('seek').value=s.duration>0?Math.round(1000*s.position/s.duration):0}$('pos').textContent=fmt(s.position);$('dur').textContent=fmt(s.duration);if(s.has_art&&s.art_key!==artKey){artKey=s.art_key;$('art').src='/api/art?k='+encodeURIComponent(artKey)}else if(!s.has_art){artKey='';$('art').removeAttribute('src')}}
+function render(s){state=s;$('dot').classList.toggle('on',s.connected);$('status').textContent=s.error||(s.state==='loading'?(s.loading_message||'Preparing audio…'):s.connected?'Connected to MiSTer Hi-Fi':'Disconnected from MiSTer Hi-Fi');$('title').textContent=s.title||'Nothing playing';$('artist').textContent=s.artist||'';$('album').textContent=s.album||'';$('play').textContent=s.state==='playing'?'❚❚':'▶';$('shuffle').classList.toggle('active',s.shuffle);$('loop').classList.toggle('active',s.loop);$('loop').textContent=s.loop_mode==='one'?'Loop 1':'Loop';$('loop').classList.toggle('active',s.loop_mode!=='off');if(!volumeDragging){$('volume').value=s.volume??100;$('volpct').textContent=(s.volume??100)+'%'}$('mute').textContent=s.muted?'🔇':'🔊';$('mute').classList.toggle('active',!!s.muted);if(!dragging){$('seek').value=s.duration>0?Math.round(1000*s.position/s.duration):0}$('pos').textContent=fmt(s.position);$('dur').textContent=fmt(s.duration);if(s.has_art&&s.art_key!==artKey){artKey=s.art_key;$('art').src='/api/art?k='+encodeURIComponent(artKey)}else if(!s.has_art){artKey='';$('art').removeAttribute('src')}}
 function connect(){const proto=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(proto+'://'+location.host+'/ws');ws.onmessage=e=>{try{render(JSON.parse(e.data))}catch{}};ws.onopen=()=>{$('dot').classList.add('on')};ws.onclose=()=>{$('dot').classList.remove('on');$('status').textContent='Disconnected from MiSTer Hi-Fi';setTimeout(connect,1500)};ws.onerror=()=>ws.close()}
 $('seek').addEventListener('pointerdown',()=>dragging=true);$('seek').addEventListener('input',()=>{if(state&&state.duration>0){let p=state.duration*$('seek').value/1000;$('pos').textContent=fmt(p)}});$('seek').addEventListener('change',async()=>{if(state&&state.duration>0){let p=state.duration*$('seek').value/1000;await api('/api/seek',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position:p})})}dragging=false});$('seek').addEventListener('pointerup',()=>dragging=false);let volumeTimer=null,volumeInFlight=false,pendingVolume=null;async function sendVolume(v,transient=false){volumeInFlight=true;try{return await api('/api/volume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({volume:Number(v),transient})})}finally{volumeInFlight=false;if(pendingVolume!==null){const n=pendingVolume;pendingVolume=null;queueVolume(n)}}}function queueVolume(v){pendingVolume=Number(v);if(volumeInFlight)return;clearTimeout(volumeTimer);volumeTimer=setTimeout(()=>{const n=pendingVolume;pendingVolume=null;if(n!==null)sendVolume(n,true)},20)}async function commitVolume(v){clearTimeout(volumeTimer);pendingVolume=null;while(volumeInFlight){await new Promise(r=>setTimeout(r,5))}await sendVolume(v,false)}function toggleMute(){return api('/api/volume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({muted:!(state&&state.muted)})})}$('volume').addEventListener('pointerdown',()=>volumeDragging=true);$('volume').addEventListener('input',()=>{volumeDragging=true;$('volpct').textContent=$('volume').value+'%';queueVolume($('volume').value)});$('volume').addEventListener('change',async()=>{await commitVolume($('volume').value);volumeDragging=false});$('volume').addEventListener('pointerup',()=>{});function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))} sources();connect();if(innerWidth<=760)tab('player');
 </script><script src="/settings.js"></script></body></html>`

@@ -131,8 +131,8 @@ func TestPlexListPaginationAndHTTPError(t *testing.T) {
 }
 func TestPlexDownloadConcurrentAndCancellation(t *testing.T) {
 	cacheTestPath(t)
-	_ = os.RemoveAll(plexTmpDir)
-	defer os.RemoveAll(plexTmpDir)
+	_ = os.RemoveAll(srvTmpDir)
+	defer os.RemoveAll(srvTmpDir)
 	var requests atomic.Int32
 	entered := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,13 +146,13 @@ func TestPlexDownloadConcurrentAndCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := PlexConfig{Server: server.URL, Token: "secret", MaxTrackMB: 1}
-	track := Track{PlexKey: "42", PlexPart: "/audio", PlexExt: ".flac"}
+	track := Track{SrvID: "plex", SrvKey: "42", SrvPart: "/audio", SrvExt: ".flac"}
 	var group sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			file, err := plexEnsureLocal(context.Background(), cfg, track)
+			file, err := srvEnsureLocal(context.Background(), &plexSession{cfg: cfg}, track)
 			if err != nil {
 				t.Error(err)
 				return
@@ -169,14 +169,14 @@ func TestPlexDownloadConcurrentAndCancellation(t *testing.T) {
 	}
 	other := cfg
 	other.Server += "/other"
-	if plexCachePath(cfg, track) == plexCachePath(other, track) {
+	if srvCachePath(&plexSession{cfg: cfg}, track) == srvCachePath(&plexSession{cfg: other}, track) {
 		t.Fatal("cache key ignores server")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	track.PlexKey = "43"
-	track.PlexPart = "/slow"
-	go func() { _, err := plexEnsureLocal(ctx, cfg, track); done <- err }()
+	track.SrvKey = "43"
+	track.SrvPart = "/slow"
+	go func() { _, err := srvEnsureLocal(ctx, &plexSession{cfg: cfg}, track); done <- err }()
 	<-entered
 	cancel()
 	select {
@@ -187,7 +187,7 @@ func TestPlexDownloadConcurrentAndCancellation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cancellation blocked")
 	}
-	files, _ := os.ReadDir(plexTmpDir)
+	files, _ := os.ReadDir(srvTmpDir)
 	for _, f := range files {
 		if strings.HasSuffix(f.Name(), ".part") {
 			t.Fatal("orphaned partial download")
@@ -196,46 +196,46 @@ func TestPlexDownloadConcurrentAndCancellation(t *testing.T) {
 }
 func TestPlexDownloadSizeLimit(t *testing.T) {
 	cacheTestPath(t)
-	_ = os.RemoveAll(plexTmpDir)
-	defer os.RemoveAll(plexTmpDir)
+	_ = os.RemoveAll(srvTmpDir)
+	defer os.RemoveAll(srvTmpDir)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "2097152")
 		w.WriteHeader(200)
 	}))
 	defer server.Close()
-	_, err := plexEnsureLocal(context.Background(), PlexConfig{Server: server.URL, Token: "secret", MaxTrackMB: 1}, Track{PlexKey: "99", PlexPart: "/large", PlexExt: ".flac"})
+	_, err := srvEnsureLocal(context.Background(), &plexSession{cfg: PlexConfig{Server: server.URL, Token: "secret", MaxTrackMB: 1}}, Track{SrvID: "plex", SrvKey: "99", SrvPart: "/large", SrvExt: ".flac"})
 	if err == nil || !strings.Contains(err.Error(), "limit") {
 		t.Fatalf("oversized download accepted: %v", err)
 	}
 }
 func TestPlexPrefetchChoiceMatchesPlayback(t *testing.T) {
 	p := newPlayer(Queue{Tracks: make([]Track, 4), Index: 1, Shuffle: true}, Config{}, false)
-	p.q.Tracks[1].PlexKey = "1"
-	next := p.plexNextLocked(false)
+	p.q.Tracks[1].SrvKey = "1"
+	next := p.srvNextLocked(false)
 	if next == 1 || next < 0 || next >= 4 {
 		t.Fatal(next)
 	}
-	if got := p.plexNextLocked(true); got != next {
+	if got := p.srvNextLocked(true); got != next {
 		t.Fatalf("prefetched %d, next plays %d", next, got)
 	}
 	p.q.Shuffle = false
 	p.q.Index = 3
-	if p.plexNextLocked(false) != -1 {
+	if p.srvNextLocked(false) != -1 {
 		t.Fatal("queue should end")
 	}
 	p.q.Repeat = true
-	if p.plexNextLocked(false) != 0 {
+	if p.srvNextLocked(false) != 0 {
 		t.Fatal("repeat should wrap")
 	}
 	p.q.RepeatOne = true
-	if p.plexNextLocked(false) != 3 {
+	if p.srvNextLocked(false) != 3 {
 		t.Fatal("repeat one should keep current track")
 	}
 }
 func TestPlexNaturalEndClosesSessionAndExport(t *testing.T) {
 	exportTestPaths(t)
 	stop := make(chan struct{})
-	p := newPlayer(Queue{Tracks: []Track{{Title: "Song", PlexKey: "42"}}}, Config{}, false)
+	p := newPlayer(Queue{Tracks: []Track{{Title: "Song", SrvKey: "42"}}}, Config{}, false)
 	p.stopped = false
 	p.stop = stop
 	p.generation = 5
@@ -255,16 +255,16 @@ func TestPlexNaturalEndClosesSessionAndExport(t *testing.T) {
 }
 func TestPlexPlayThresholdUsesHeardTime(t *testing.T) {
 	track := Track{Duration: 180}
-	if plexPlayedEnough(track, 10*time.Second) {
+	if srvPlayedEnough(track, 10*time.Second) {
 		t.Fatal("short listen scrobbled")
 	}
-	if !plexPlayedEnough(track, 90*time.Second) {
+	if !srvPlayedEnough(track, 90*time.Second) {
 		t.Fatal("half-track not counted")
 	}
-	if plexPlayedEnough(Track{Duration: 1000}, 239*time.Second) {
+	if srvPlayedEnough(Track{Duration: 1000}, 239*time.Second) {
 		t.Fatal("long track counted too early")
 	}
-	if !plexPlayedEnough(Track{Duration: 1000}, 240*time.Second) {
+	if !srvPlayedEnough(Track{Duration: 1000}, 240*time.Second) {
 		t.Fatal("four minutes not counted")
 	}
 }
@@ -281,19 +281,19 @@ func TestPlexWebBrowseAndPlaylistOrder(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := PlexConfig{Server: server.URL, Token: "secret", Library: "1"}
-	entries, _, err := plexBrowse(context.Background(), cfg, "/")
+	entries, _, err := srvWebBrowse(context.Background(), &plexSession{cfg: cfg}, "Plex", "/")
 	if err != nil || len(entries) != 4 {
 		t.Fatal(entries, err)
 	}
-	entries, _, err = plexBrowse(context.Background(), cfg, "/albums")
+	entries, _, err = srvWebBrowse(context.Background(), &plexSession{cfg: cfg}, "Plex", "/albums")
 	if err != nil || len(entries) != 1 || entries[0].Name != "Artist - Album" {
 		t.Fatal(entries, err)
 	}
-	entries, tracks, err := plexBrowse(context.Background(), cfg, "/playlists/7")
+	entries, tracks, err := srvWebBrowse(context.Background(), &plexSession{cfg: cfg}, "Plex", "/playlists/7")
 	if err != nil || len(tracks) != 2 || tracks[0].Title != "Second" || entries[1].Path != "/playlists/7/track/1" {
 		t.Fatal(entries, tracks, err)
 	}
-	if _, _, err = plexBrowse(context.Background(), cfg, "/albums/http:evil"); err == nil {
+	if _, _, err = srvWebBrowse(context.Background(), &plexSession{cfg: cfg}, "Plex", "/albums/http:evil"); err == nil {
 		t.Fatal("invalid path accepted")
 	}
 }
@@ -313,14 +313,14 @@ func TestPlexSessionStopReportsStopped(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := PlexConfig{Server: server.URL, Token: "secret", Scrobbling: "none"}
-	track := Track{PlexKey: "1", Duration: 180, PlexSource: &cfg}
+	track := Track{SrvID: "plex", SrvKey: "1", Duration: 180, Srv: &plexSession{cfg: cfg}}
 	p := newPlayer(Queue{Tracks: []Track{track}}, Config{}, false)
 	stop := make(chan struct{})
 	p.stop = stop
 	p.stopped = false
 	p.generation = 1
 	done := make(chan struct{})
-	go func() { p.plexSession(track, stop, 1); close(done) }()
+	go func() { p.srvSession(track, stop, 1); close(done) }()
 	deadline := time.Now().Add(time.Second)
 	for playing.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -337,9 +337,9 @@ func TestPlexSessionStopReportsStopped(t *testing.T) {
 }
 func cacheTestPath(t *testing.T) {
 	t.Helper()
-	old := plexTmpDir
-	plexTmpDir = t.TempDir()
-	t.Cleanup(func() { plexTmpDir = old })
+	old := srvTmpDir
+	srvTmpDir = t.TempDir()
+	t.Cleanup(func() { srvTmpDir = old })
 }
 
 func TestPlexPlaybackPreparationDoesNotBlockStop(t *testing.T) {
@@ -349,7 +349,7 @@ func TestPlexPlaybackPreparationDoesNotBlockStop(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { entered <- struct{}{}; <-r.Context().Done() }))
 	defer server.Close()
 	cfg := PlexConfig{Server: server.URL, Token: "secret", MaxTrackMB: 1}
-	track := Track{Title: "Slow", PlexKey: "1", PlexPart: "/slow", PlexExt: ".flac", PlexSource: &cfg}
+	track := Track{Title: "Slow", SrvID: "plex", SrvKey: "1", SrvPart: "/slow", SrvExt: ".flac", Srv: &plexSession{cfg: cfg}}
 	p := newPlayer(Queue{Tracks: []Track{track}}, Config{}, false)
 	start := time.Now()
 	if err := p.playCurrent(); err != nil {
@@ -369,7 +369,7 @@ func TestPlexPlaybackPreparationDoesNotBlockStop(t *testing.T) {
 		t.Fatal("stop blocked on download")
 	}
 	done := make(chan struct{})
-	go func() { plexWorkers.Wait(); close(done) }()
+	go func() { srvWorkers.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -381,7 +381,7 @@ func TestPlexPlaybackPreparationDoesNotBlockStop(t *testing.T) {
 }
 func TestOldPlexWorkerCannotRemoveNewCache(t *testing.T) {
 	cacheTestPath(t)
-	file := filepath.Join(plexTmpDir, "current.flac")
+	file := filepath.Join(srvTmpDir, "current.flac")
 	if err := os.WriteFile(file, []byte("current"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +389,7 @@ func TestOldPlexWorkerCannotRemoveNewCache(t *testing.T) {
 	p.stop = make(chan struct{})
 	p.stopped = false
 	p.generation = 2
-	if p.plexTrimCache(context.Background(), map[string]bool{}, make(chan struct{}), 1) {
+	if p.srvTrimCache(context.Background(), map[string]bool{}, make(chan struct{}), 1) {
 		t.Fatal("stale worker accepted")
 	}
 	if _, err := os.Stat(file); err != nil {

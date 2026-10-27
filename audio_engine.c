@@ -662,20 +662,23 @@ static void* mh_file_decode_worker(void* arg) {
             pthread_mutex_unlock(&g.next_mutex);
             if (next_fd >= 0) {
                 ma_uint64 boundary = g.frames_written;
-                ma_decoder next_decoder;
                 ma_decoder_config dc = ma_decoder_config_init(ma_format_f32, MH_CHANNELS, MH_RATE);
                 mh_fd_source* next_source = (mh_fd_source*)calloc(1, sizeof(*next_source));
                 if (next_source) {
                     next_source->fd = next_fd;
-                    if (mh_decoder_init_fd_source(next_source, &dc, &next_decoder) == MA_SUCCESS) {
+                    /* The old decoder is at its end. The new one is set up in g.decoder itself: a
+                     * ma_decoder points into itself, so a copy of it (g.decoder = next) keeps pointers
+                     * to the original, and the first seek in the new track crashed. */
+                    ma_decoder_uninit(&g.decoder);
+                    mh_fd_source_free(g.decoder_source);
+                    g.decoder_source = NULL;
+                    g.decoder_init = 0;
+                    if (mh_decoder_init_fd_source(next_source, &dc, &g.decoder) == MA_SUCCESS) {
                         ma_uint64 next_frames = 0;
                         double next_duration = 0.0;
-                        if (ma_decoder_get_length_in_pcm_frames(&next_decoder, &next_frames) == MA_SUCCESS) {
+                        if (ma_decoder_get_length_in_pcm_frames(&g.decoder, &next_frames) == MA_SUCCESS) {
                             next_duration = (double)next_frames / (double)MH_RATE;
                         }
-                        ma_decoder_uninit(&g.decoder);
-                        mh_fd_source_free(g.decoder_source);
-                        g.decoder = next_decoder;
                         g.decoder_source = next_source;
                         g.decoder_init = 1;
                         g.pending_duration = next_duration;

@@ -1,0 +1,6 @@
+{
+  "server": "http://192.168.1.10:8096",
+  "library": "",
+  "insecure": false,
+  "lastfm_scrobble": false
+}

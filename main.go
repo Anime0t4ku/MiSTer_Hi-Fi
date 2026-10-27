@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -32,7 +33,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.13.0"
+const version = "1.14.0"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 
 var appConfigPath = filepath.Join(baseDir, "config.json")
@@ -50,29 +51,34 @@ var screenSaverSeconds atomic.Int64
 var screenSaverActive atomic.Bool
 
 type Config struct {
-	Navigation            NavigationConfig `json:"navigation"`
-	EQ                    EQConfig         `json:"eq"`
-	Visualizer            string           `json:"visualizer"`
-	OLEDMode              bool             `json:"oled_mode"`
-	HideAlbumArt          bool             `json:"hide_album_art"`
-	AutoHideMissingArt    bool             `json:"auto_hide_missing_art"`
-	PrioritizeExternalArt bool             `json:"prioritize_external_art"`
-	RememberShuffleLoop   bool             `json:"remember_shuffle_loop"`
-	SavedShuffle          bool             `json:"saved_shuffle"`
-	SavedLoop             bool             `json:"saved_loop"`
-	SavedLoopOne          bool             `json:"saved_loop_one"`
-	Volume                int              `json:"volume"`
-	Muted                 bool             `json:"muted"`
-	ShowClock             bool             `json:"show_clock"`
-	ConfirmOnExit         bool             `json:"confirm_on_exit"`
-	ScreenSaverSeconds    int              `json:"screensaver_seconds"`
-	GaplessPlayback       bool             `json:"gapless_playback"`
-	SwapAB                bool             `json:"swap_ab"`
-	SwapXY                bool             `json:"swap_xy"`
-	CustomFont            string           `json:"custom_font"`
-	WebRemoteEnabled      bool             `json:"web_remote_enabled"`
-	WebRemotePort         int              `json:"web_remote_port"`
-	LastFM                LastFMConfig     `json:"lastfm"`
+	Navigation            NavigationConfig   `json:"navigation"`
+	EQ                    EQConfig           `json:"eq"`
+	Visualizer            string             `json:"visualizer"`
+	GBAMusicEnabled       bool               `json:"gba_music_enabled"`
+	FPSTarget             int                `json:"fps_target"`
+	AccentColour          string             `json:"accent_colour"`
+	ShowWebAddress        bool               `json:"show_web_address"`
+	OLEDMode              bool               `json:"oled_mode"`
+	HideAlbumArt          bool               `json:"hide_album_art"`
+	AutoHideMissingArt    bool               `json:"auto_hide_missing_art"`
+	PrioritizeExternalArt bool               `json:"prioritize_external_art"`
+	RememberShuffleLoop   bool               `json:"remember_shuffle_loop"`
+	SavedShuffle          bool               `json:"saved_shuffle"`
+	SavedLoop             bool               `json:"saved_loop"`
+	SavedLoopOne          bool               `json:"saved_loop_one"`
+	Volume                int                `json:"volume"`
+	Muted                 bool               `json:"muted"`
+	ShowClock             bool               `json:"show_clock"`
+	ConfirmOnExit         bool               `json:"confirm_on_exit"`
+	ScreenSaverSeconds    int                `json:"screensaver_seconds"`
+	GaplessPlayback       bool               `json:"gapless_playback"`
+	SwapAB                bool               `json:"swap_ab"`
+	SwapXY                bool               `json:"swap_xy"`
+	CustomFont            string             `json:"custom_font"`
+	WebRemoteEnabled      bool               `json:"web_remote_enabled"`
+	WebRemotePort         int                `json:"web_remote_port"`
+	LastFM                LastFMConfig       `json:"lastfm"`
+	ListenBrainz          ListenBrainzConfig `json:"listenbrainz"`
 }
 type EQConfig struct {
 	Enabled                            bool `json:"enabled"`
@@ -89,7 +95,7 @@ type RadioConfig struct {
 	Stations []RadioStation `json:"stations"`
 }
 type RadioStation struct {
-	Name, URL, Genre string
+	Name, URL, Genre, Logo string
 }
 type Track struct {
 	Path, Title, Artist, Album    string
@@ -100,9 +106,15 @@ type Track struct {
 	MediaFormat                   string
 	BitDepth, SampleRate, BitRate int
 	Art                           image.Image
-	PlexKey, PlexPart, PlexExt    string
-	PlexThumb                     string
-	PlexSource                    *PlexConfig
+	// Set for tracks from a media server (mediaserver.go): which server, the
+	// item's key there, what Download needs, the file extension and the cover,
+	// and the session the track was listed through (a snapshot of its config).
+	SrvID, SrvKey, SrvPart, SrvExt, SrvThumb string
+	Srv                                      mediaSession
+	Number                                   int         // track number on its album, when known
+	RadioName                                string      // station name; set for Online Radio tracks
+	RadioLogo                                image.Image // station logo, shown on the Monitor instead of the song cover
+	ArtReset                                 bool        // merge Art even when nil (radio: drop the previous song's cover)
 }
 type Queue struct {
 	Tracks                     []Track
@@ -221,6 +233,7 @@ const (
 var font = map[rune][7]byte{
 	'A': {14, 17, 17, 31, 17, 17, 17}, 'B': {30, 17, 17, 30, 17, 17, 30}, 'C': {14, 17, 16, 16, 16, 17, 14}, 'D': {30, 17, 17, 17, 17, 17, 30}, 'E': {31, 16, 16, 30, 16, 16, 31}, 'F': {31, 16, 16, 30, 16, 16, 16}, 'G': {14, 17, 16, 23, 17, 17, 15}, 'H': {17, 17, 17, 31, 17, 17, 17}, 'I': {14, 4, 4, 4, 4, 4, 14}, 'J': {7, 2, 2, 2, 18, 18, 12}, 'K': {17, 18, 20, 24, 20, 18, 17}, 'L': {16, 16, 16, 16, 16, 16, 31}, 'M': {17, 27, 21, 21, 17, 17, 17}, 'N': {17, 25, 21, 19, 17, 17, 17}, 'O': {14, 17, 17, 17, 17, 17, 14}, 'P': {30, 17, 17, 30, 16, 16, 16}, 'Q': {14, 17, 17, 17, 21, 18, 13}, 'R': {30, 17, 17, 30, 20, 18, 17}, 'S': {15, 16, 16, 14, 1, 1, 30}, 'T': {31, 4, 4, 4, 4, 4, 4}, 'U': {17, 17, 17, 17, 17, 17, 14}, 'V': {17, 17, 17, 17, 17, 10, 4}, 'W': {17, 17, 17, 21, 21, 21, 10}, 'X': {17, 17, 10, 4, 10, 17, 17}, 'Y': {17, 17, 10, 4, 4, 4, 4}, 'Z': {31, 1, 2, 4, 8, 16, 31},
 	'0': {14, 17, 19, 21, 25, 17, 14}, '1': {4, 12, 4, 4, 4, 4, 14}, '2': {14, 17, 1, 2, 4, 8, 31}, '3': {30, 1, 1, 14, 1, 1, 30}, '4': {2, 6, 10, 18, 31, 2, 2}, '5': {31, 16, 16, 30, 1, 1, 30}, '6': {14, 16, 16, 30, 17, 17, 14}, '7': {31, 1, 2, 4, 8, 8, 8}, '8': {14, 17, 17, 14, 17, 17, 14}, '9': {14, 17, 17, 15, 1, 1, 14},
+	',': {0, 0, 0, 0, 12, 4, 8}, ';': {0, 12, 12, 0, 12, 4, 8}, '!': {4, 4, 4, 4, 4, 0, 4}, '?': {14, 17, 1, 2, 4, 0, 4}, '\'': {4, 4, 8, 0, 0, 0, 0}, '"': {10, 10, 0, 0, 0, 0, 0}, '&': {12, 18, 20, 8, 21, 18, 13}, '*': {0, 21, 14, 31, 14, 21, 0}, '#': {10, 10, 31, 10, 31, 10, 10}, '@': {14, 17, 23, 21, 23, 16, 14}, '$': {4, 15, 20, 14, 5, 30, 4}, '|': {4, 4, 4, 4, 4, 4, 4}, '~': {0, 0, 8, 21, 2, 0, 0}, '^': {4, 10, 17, 0, 0, 0, 0}, '\\': {16, 8, 8, 4, 2, 2, 1},
 	'-': {0, 0, 0, 31, 0, 0, 0}, '_': {0, 0, 0, 0, 0, 0, 31}, '.': {0, 0, 0, 0, 0, 12, 12}, '/': {1, 2, 2, 4, 8, 8, 16}, ':': {0, 12, 12, 0, 12, 12, 0}, ' ': {0, 0, 0, 0, 0, 0, 0}, '>': {16, 8, 4, 2, 4, 8, 16}, '<': {1, 2, 4, 8, 4, 2, 1}, '+': {0, 4, 4, 31, 4, 4, 0}, '=': {0, 31, 0, 31, 0, 0, 0}, '%': {17, 2, 4, 8, 17, 0, 0}, '(': {2, 4, 8, 8, 8, 4, 2}, ')': {8, 4, 2, 2, 2, 4, 8}, '[': {14, 8, 8, 8, 8, 8, 14}, ']': {14, 2, 2, 2, 2, 2, 14},
 }
 
@@ -884,7 +897,7 @@ func (t *termState) restore() {
 }
 
 func defaultConfig() Config {
-	return Config{Navigation: defaultNavigationConfig(), Visualizer: "bars", ConfirmOnExit: true, WebRemoteEnabled: true, WebRemotePort: defaultWebRemotePort, Volume: 100}
+	return Config{Navigation: defaultNavigationConfig(), Visualizer: "bars", AccentColour: defaultAccentHex, FPSTarget: 30, ConfirmOnExit: true, WebRemoteEnabled: true, WebRemotePort: defaultWebRemotePort, Volume: 100}
 }
 func loadConfig() Config {
 	c := defaultConfig()
@@ -916,6 +929,8 @@ func loadConfig() Config {
 	if c.Visualizer == "" {
 		c.Visualizer = "bars"
 	}
+	c.FPSTarget = normalizeFPSTarget(c.FPSTarget)
+	c.AccentColour = setAccent(c.AccentColour)
 	if _, ok := raw["web_remote_enabled"]; !ok {
 		c.WebRemoteEnabled = true
 	}
@@ -1056,6 +1071,7 @@ func loadRadio() (RadioConfig, error) {
 		station.Name = strings.TrimSpace(station.Name)
 		station.URL = strings.TrimSpace(station.URL)
 		station.Genre = strings.TrimSpace(station.Genre)
+		station.Logo = strings.TrimSpace(station.Logo)
 		if station.Name == "" || !isHTTPURL(station.URL) {
 			continue
 		}
@@ -2179,6 +2195,15 @@ func resolveExternalTarget(raw string) (string, error) {
 }
 
 func externalQueue(raw string) (Queue, error) {
+	if strings.HasPrefix(normalizeExternalTarget(raw), "gba:") && !loadConfig().GBAMusicEnabled {
+		return Queue{}, errors.New("GBA Music (Experimental) is disabled in Settings")
+	}
+	if q, handled, err := srvExternalQueue(normalizeExternalTarget(raw)); handled {
+		return q, err
+	}
+	if q, handled, err := gbaExternalQueue(normalizeExternalTarget(raw)); handled {
+		return q, err
+	}
 	path, e := resolveExternalTarget(raw)
 	if e != nil {
 		return Queue{}, e
@@ -2247,9 +2272,11 @@ func externalListener(ch chan<- string) (net.Listener, error) {
 type Player struct {
 	opMu               sync.Mutex
 	prepareCancel      context.CancelFunc
+	gbaPreparingSince  time.Time
+	gbaPreparedFrames  int64
 	loading            bool
 	playbackError      string
-	plexPlan           plexNextPlan
+	srvPlan            srvNextPlan
 	mu                 sync.Mutex
 	q                  Queue
 	paused             bool
@@ -2312,7 +2339,7 @@ func mergeTrackMetadata(dst *Track, src Track) {
 	if src.Duration > 0 {
 		dst.Duration = src.Duration
 	}
-	if src.Art != nil {
+	if src.Art != nil || src.ArtReset {
 		dst.Art = src.Art
 	}
 }
@@ -2343,20 +2370,38 @@ func (p *Player) radioTitleCallback(index int, station Track, cfg Config) func(s
 			meta.Title = streamTitle
 			meta.Artist = ""
 		}
+		// Station logo until (and unless) a cover for this song is found.
+		meta.Art, meta.ArtReset = station.Art, true
 		p.commitTrackMetadata(index, station.Path, meta)
 
 		if title == "" {
 			return
 		}
+		if artist != "" {
+			go func() {
+				cover := radioCover(artist, title)
+				if cover == nil {
+					return
+				}
+				p.mu.Lock()
+				cur := index >= 0 && index < len(p.q.Tracks) && p.q.Tracks[index].Path == station.Path && p.q.Tracks[index].Title == title
+				p.mu.Unlock()
+				if cur {
+					meta.Art = cover
+					p.commitTrackMetadata(index, station.Path, meta)
+				}
+			}()
+		}
 		// The station name (station.Title) is intentionally not sent as the
 		// Last.fm album - StreamTitle rarely carries real album info, and
 		// Last.fm treats "album" as the song's album, not the radio station.
 		lastfmTrackStarted(cfg.LastFM, artist, title, "", 0)
+		lbTrackStarted(cfg.ListenBrainz, artist, title, "", 0)
 	}
 }
 
 func (p *Player) loadCurrentMetadata(index int, src Track) {
-	if strings.HasPrefix(src.Path, "cdda:") || isHTTPURL(src.Path) {
+	if strings.HasPrefix(src.Path, "cdda:") || strings.HasPrefix(src.Path, "gba:") || isHTTPURL(src.Path) {
 		return
 	}
 
@@ -2434,7 +2479,15 @@ func (p *Player) current() *Track {
 	return &t
 }
 func gaplessTrackSupported(t Track) bool {
-	if t.PlexKey != "" || strings.HasPrefix(t.Path, "plex:") || isHTTPURL(t.Path) {
+	if t.SrvKey != "" {
+		// a server track plays from its cached copy, so what counts is its format
+		switch strings.ToLower(t.SrvExt) {
+		case ".flac", ".wav":
+			return true
+		}
+		return false
+	}
+	if isServerPath(t.Path) || isHTTPURL(t.Path) {
 		return false
 	}
 	if strings.HasPrefix(t.Path, "cdda:") {
@@ -2471,6 +2524,22 @@ func (p *Player) nextQueueIndexLocked(from int) int {
 	return -1
 }
 
+// nextGaplessIndexLocked is the entry that is queued behind the current one.
+// Server tracks follow the same plan as their prefetch (which also covers
+// shuffle); local files do not shuffle gaplessly.
+func (p *Player) nextGaplessIndexLocked(from int) int {
+	if from < 0 || from >= len(p.q.Tracks) {
+		return -1
+	}
+	if p.q.Tracks[from].SrvKey == "" {
+		return p.nextQueueIndexLocked(from)
+	}
+	if p.q.Repeat && p.q.RepeatOne {
+		return -1
+	}
+	return p.srvNextLocked(false)
+}
+
 func (p *Player) prepareGaplessNextFile() {
 	p.mu.Lock()
 	if !p.cfg.GaplessPlayback || p.stopped || p.q.Index < 0 || p.q.Index >= len(p.q.Tracks) {
@@ -2479,7 +2548,7 @@ func (p *Player) prepareGaplessNextFile() {
 		return
 	}
 	current := p.q.Tracks[p.q.Index]
-	nextIndex := p.nextQueueIndexLocked(p.q.Index)
+	nextIndex := p.nextGaplessIndexLocked(p.q.Index)
 	if nextIndex < 0 || nextIndex >= len(p.q.Tracks) {
 		p.gaplessQueuedIndex = -1
 		p.mu.Unlock()
@@ -2489,10 +2558,24 @@ func (p *Player) prepareGaplessNextFile() {
 	if strings.HasPrefix(current.Path, "cdda:") || strings.HasPrefix(next.Path, "cdda:") ||
 		strings.HasPrefix(current.Path, "vcdcue:") || strings.HasPrefix(next.Path, "vcdcue:") ||
 		strings.HasPrefix(current.Path, "vcdchd:") || strings.HasPrefix(next.Path, "vcdchd:") ||
+		strings.HasPrefix(current.Path, "gba:") || strings.HasPrefix(next.Path, "gba:") ||
 		!gaplessTrackSupported(current) || !gaplessTrackSupported(next) {
 		p.gaplessQueuedIndex = -1
 		p.mu.Unlock()
 		return
+	}
+	if next.SrvKey != "" {
+		// a server track is queued from its cached copy, once the prefetch has it
+		local := ""
+		if next.Srv != nil {
+			local = srvCachePath(next.Srv, next)
+		}
+		if st, err := os.Stat(local); local == "" || err != nil || st.Size() == 0 {
+			p.gaplessQueuedIndex = -1
+			p.mu.Unlock()
+			return
+		}
+		next.Path, next.UseDirFD = local, false
 	}
 	p.gaplessQueuedIndex = nextIndex
 	p.mu.Unlock()
@@ -2524,8 +2607,23 @@ func (p *Player) handleGaplessTransitionUnlocked() {
 	p.basePosition = 0
 	p.paused = false
 	p.stopped = false
+	stop, generation := p.stop, p.generation
+	if t.SrvKey != "" && t.Srv != nil {
+		// the track now plays from its cached copy, as after prepareSrvTrack
+		t.Path = srvCachePath(t.Srv, t)
+		p.q.Tracks[nextIndex] = t
+	}
 	p.mu.Unlock()
-	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") {
+	if t.SrvKey != "" && t.Srv != nil {
+		// what startPreparedTrackUnlocked does for a server track, apart from the audio
+		fmt.Fprintf(os.Stderr, "gapless: %s -> %s\n", t.SrvID, t.Title)
+		p.loadCurrentMetadata(nextIndex, t)
+		runSrvWorker(func() { p.srvSession(t, stop, generation) })
+		runSrvWorker(func() { p.srvArtwork(t, nextIndex, stop, generation) })
+		runSrvWorker(func() { p.srvPrefetch(nextIndex, t, stop, generation) })
+		return
+	}
+	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") && !strings.HasPrefix(t.Path, "gba:") {
 		p.loadCurrentMetadata(nextIndex, t)
 		p.prepareGaplessNextFile()
 	}
@@ -2558,14 +2656,25 @@ func (p *Player) playCurrentUnlocked() error {
 	p.playbackError = ""
 	p.mu.Unlock()
 	go p.monitorNowPlaying(stop, generation)
-	if t.PlexKey != "" {
+	if strings.HasPrefix(t.Path, "gba:") {
+		ctx, cancel := context.WithCancel(context.Background())
+		p.mu.Lock()
+		p.prepareCancel = cancel
+		p.gbaPreparingSince = time.Now()
+		p.gbaPreparedFrames = 0
+		p.loading = true
+		p.mu.Unlock()
+		runSrvWorker(func() { defer cancel(); p.prepareGBATrack(ctx, t, idx, stop, generation, cfg) })
+		return nil
+	}
+	if t.SrvKey != "" {
 		ctx, cancel := context.WithCancel(context.Background())
 		p.mu.Lock()
 		p.prepareCancel = cancel
 		p.loading = true
 		p.playbackError = ""
 		p.mu.Unlock()
-		runPlexWorker(func() { p.preparePlexTrack(ctx, t, idx, stop, generation, cfg) })
+		runSrvWorker(func() { p.prepareSrvTrack(ctx, t, idx, stop, generation, cfg) })
 		return nil
 	}
 	return p.startPreparedTrackUnlocked(t, idx, stop, generation, cfg)
@@ -2593,13 +2702,14 @@ func (p *Player) startPreparedTrackUnlocked(t Track, idx int, stop chan struct{}
 		err = nativeAudioStartTrack(t, cfg.EQ)
 		if err == nil {
 			p.loadCurrentMetadata(idx, t)
-			if t.PlexKey != "" {
-				// Report this playback session using the configured scrobbling mode.
-				runPlexWorker(func() { p.plexSession(t, stop, generation) })
-				runPlexWorker(func() { p.plexArtwork(t, idx, stop, generation) })
-				runPlexWorker(func() { p.plexPrefetch(idx, t, stop, generation) })
+			if t.SrvKey != "" {
+				// Report this playback session using the server's scrobbling mode.
+				runSrvWorker(func() { p.srvSession(t, stop, generation) })
+				runSrvWorker(func() { p.srvArtwork(t, idx, stop, generation) })
+				runSrvWorker(func() { p.srvPrefetch(idx, t, stop, generation) })
 			} else if cur := p.current(); cur != nil {
 				lastfmTrackStarted(cfg.LastFM, cur.Artist, cur.Title, cur.Album, cur.Duration)
+				lbTrackStarted(cfg.ListenBrainz, cur.Artist, cur.Title, cur.Album, cur.Duration)
 			}
 		}
 	}
@@ -2615,7 +2725,7 @@ func (p *Player) startPreparedTrackUnlocked(t Track, idx int, stop chan struct{}
 		p.mu.Unlock()
 		return err
 	}
-	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") && !isHTTPURL(t.Path) {
+	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") && !strings.HasPrefix(t.Path, "gba:") && !isHTTPURL(t.Path) {
 		p.prepareGaplessNextFile()
 	}
 	go p.monitorPlayback(stop, generation)
@@ -2946,6 +3056,7 @@ func (p *Player) stopAndResetUnlocked() {
 	cfg := p.cfg
 	p.mu.Unlock()
 	lastfmTrackStopped(cfg.LastFM)
+	lbTrackStopped(cfg.ListenBrainz)
 }
 func (a *App) stopAndUnload() {
 	if a.player == nil {
@@ -2985,7 +3096,7 @@ func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
 		p.mu.Unlock()
 		return
 	}
-	if next := p.plexNextLocked(false); next >= 0 {
+	if next := p.srvNextLocked(false); next >= 0 {
 		p.q.Index = next
 	} else {
 		if p.stop != nil {
@@ -3006,6 +3117,7 @@ func (p *Player) advanceUnlocked(generation uint64, stop <-chan struct{}) {
 		nativeAudioStop()
 		clearNowPlaying()
 		lastfmTrackStopped(cfg.LastFM)
+		lbTrackStopped(cfg.ListenBrainz)
 		return
 	}
 	p.mu.Unlock()
@@ -3026,7 +3138,7 @@ func (p *Player) next() {
 	defer p.opMu.Unlock()
 	p.mu.Lock()
 	if len(p.q.Tracks) > 0 {
-		p.q.Index = p.plexNextLocked(true)
+		p.q.Index = p.srvNextLocked(true)
 	}
 	p.mu.Unlock()
 	_ = p.playCurrentUnlocked()
@@ -3101,7 +3213,13 @@ func (p *Player) seekBy(seconds float64) {
 	if isHTTPURL(t.Path) {
 		return
 	}
-	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") {
+	if strings.HasPrefix(t.Path, "gba:") {
+		if !p.isLoading() {
+			_ = nativeAudioSeek(target)
+		}
+		return
+	}
+	if !strings.HasPrefix(t.Path, "cdda:") && !strings.HasPrefix(t.Path, "vcdcue:") && !strings.HasPrefix(t.Path, "vcdchd:") && !strings.HasPrefix(t.Path, "gba:") {
 		_ = nativeAudioSeek(target)
 		return
 	}
@@ -3173,6 +3291,14 @@ func appBackground(cfg *Config) color.RGBA {
 	return color.RGBA{8, 9, 13, 255}
 }
 
+// oledSurface preserves normal theme colours and removes decorative fills in OLED mode.
+func oledSurface(cfg *Config, normal color.RGBA) color.RGBA {
+	if cfg != nil && cfg.OLEDMode {
+		return color.RGBA{0, 0, 0, 255}
+	}
+	return normal
+}
+
 func playerBackground(cfg *Config) color.RGBA {
 	if cfg != nil && cfg.OLEDMode {
 		return color.RGBA{0, 0, 0, 255}
@@ -3194,17 +3320,22 @@ func clockText(cfg *Config) string {
 	return time.Now().Format("15:04")
 }
 
+// clockBox is the rectangle drawClock owns (and clears, also with the clock
+// off): top right, above the separator line drawn at y=52.
+func clockBox(fb *framebuffer) (x, y, w, h int) {
+	const scale, margin, pad = 3, 30, 4
+	h = scale*7 + pad*2
+	w = tw(scale, "88:88") + pad*2
+	return fb.w - margin - w, 18, w, h
+}
+
 func drawClock(fb *framebuffer, cfg *Config, bg color.RGBA) (int, int, int, int) {
 	txt := clockText(cfg)
 	// Match the menu title/version typography and keep the clock fully above
 	// the separator line drawn at y=52.
 	scale := 3
-	margin := 30
 	pad := 4
-	h := scale*7 + pad*2
-	w := tw(scale, "88:88") + pad*2
-	x := fb.w - margin - w
-	y := 18
+	x, y, w, h := clockBox(fb)
 	fb.rect(x, y, w, h, bg)
 	if txt != "" {
 		fb.text(x+w-pad-tw(scale, txt), 22, scale, txt, color.RGBA{245, 245, 245, 255})
@@ -3229,6 +3360,13 @@ func closeQueueDirFD(q *Queue) {
 }
 
 func (a *App) startQueue(q Queue, origin *browseOrigin) error {
+	if !a.cfg.GBAMusicEnabled {
+		for _, t := range q.Tracks {
+			if strings.HasPrefix(t.Path, "gba:") {
+				return errors.New("GBA Music (Experimental) is disabled in Settings")
+			}
+		}
+	}
 	if a.cfg.RememberShuffleLoop {
 		q.Shuffle = a.cfg.SavedShuffle
 		q.Repeat = a.cfg.SavedLoop
@@ -3354,10 +3492,11 @@ func (a *App) cycleRepeat() {
 		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "cdda:") &&
 		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "vcdcue:") &&
 		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "vcdchd:") &&
+		!strings.HasPrefix(p.q.Tracks[p.q.Index].Path, "gba:") &&
 		!isHTTPURL(p.q.Tracks[p.q.Index].Path)
 	desiredQueuedIndex := -1
 	if filePlayback {
-		desiredQueuedIndex = p.nextQueueIndexLocked(p.q.Index)
+		desiredQueuedIndex = p.nextGaplessIndexLocked(p.q.Index)
 	}
 	paused := p.paused
 	p.mu.Unlock()
@@ -3498,14 +3637,19 @@ func (a *App) handlePlaybackShortcut(act action) bool {
 	return false
 }
 
+// lastTitleWidth is the width of the title drawn last, so the web remote address
+// can keep clear of it whatever the screen's title is.
+var lastTitleWidth atomic.Int64
+
 func drawTitle(fb *framebuffer, s string) {
 	white := color.RGBA{245, 245, 245, 255}
+	lastTitleWidth.Store(int64(tw(3, s)))
 	fb.text(30, 22, 3, s, white)
 	fb.rect(30, 52, fb.w-60, 2, color.RGBA{70, 70, 78, 255})
 }
 
 func drawWebRemoteAddress(app *App) {
-	if app == nil || app.webRemoteAddr == "" {
+	if app == nil || app.webRemoteAddr == "" || !app.cfg.ShowWebAddress {
 		return
 	}
 	fb := app.fb
@@ -3513,7 +3657,16 @@ func drawWebRemoteAddress(app *App) {
 	scale := 3
 	text := app.webRemoteAddr
 	x := (fb.w - tw(scale, text)) / 2
-	fb.text(x, 22, scale, text, color.RGBA{170, 170, 175, 255})
+	// On a narrow screen the centered address runs into the title (and the
+	// clock): draw it small, right-aligned, under the separator line instead.
+	y := 22
+	titleEnd := 30 + max(tw(3, "MISTER HI-FI v"+version), int(lastTitleWidth.Load())) + 24
+	if fb.w-30-tw(scale, text) < titleEnd {
+		scale = 1
+		x = fb.w - 30 - tw(scale, text)
+		y = 57
+	}
+	fb.text(x, y, scale, text, color.RGBA{170, 170, 175, 255})
 }
 
 func drawCircleOutline(fb *framebuffer, cx, cy, r, thick int, c color.RGBA) {
@@ -3637,10 +3790,10 @@ func drawNowPlayingBar(app *App, selected bool) int {
 	fb := app.fb
 	h := max(46, fb.h/15)
 	y := fb.h - h - 42
-	bg := color.RGBA{24, 26, 33, 255}
+	bg := oledSurface(app.cfg, color.RGBA{24, 26, 33, 255})
 	fb.rect(30, y, fb.w-60, h, bg)
 	if selected {
-		fb.border(30, y, fb.w-60, h, 2, color.RGBA{245, 245, 245, 255})
+		fb.border(30, y, fb.w-60, h, 2, accentColour())
 	}
 	scale := max(1, h/24)
 	label := short(app.nowPlayingText(), max(20, (fb.w-100)/(6*scale)))
@@ -3672,7 +3825,8 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 		fb.fill(appBackground(app.cfg))
 		drawTitle(fb, title)
 		drawWebRemoteAddress(app)
-		row := max(30, fb.h/10)
+		// Keep the same compact rows throughout sources, folders and track lists.
+		row := max(30, fb.h/13)
 		reserve := 45
 		if hasBar {
 			reserve += max(46, fb.h/15) + 8
@@ -3706,8 +3860,8 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 				continue
 			}
 			if i == sel {
-				fb.rect(45, y-5, fb.w-90, row-5, color.RGBA{35, 37, 46, 255})
-				fb.border(45, y-5, fb.w-90, row-5, 2, color.RGBA{240, 240, 240, 255})
+				fb.rect(45, y-5, fb.w-90, row-5, oledSurface(app.cfg, color.RGBA{35, 37, 46, 255}))
+				fb.border(45, y-5, fb.w-90, row-5, 2, accentColour())
 			}
 			fb.text(65, y+6, max(1, row/22), it, color.RGBA{235, 235, 235, 255})
 			y += row
@@ -4337,8 +4491,14 @@ func drawInfoBadges(fb *framebuffer, x, y, maxW, lineScale int, t Track, cfg *Co
 		if x+w > maxW {
 			break
 		}
-		fb.rect(x, y, w, blockH, white)
-		fb.text(x+padX, textY, fontScale, item, bgText)
+		if cfg != nil && cfg.OLEDMode {
+			fb.rect(x, y, w, blockH, bgText)
+			fb.border(x, y, w, blockH, 1, accentColour())
+			fb.text(x+padX, textY, fontScale, item, white)
+		} else {
+			fb.rect(x, y, w, blockH, white)
+			fb.text(x+padX, textY, fontScale, item, bgText)
+		}
 		x += w + gap
 	}
 }
@@ -4355,7 +4515,7 @@ func drawPlayerStatic(fb *framebuffer, p *Player, sel int, cfg *Config) playerLa
 		if t.Art != nil {
 			fb.drawImage(t.Art, l.margin, l.top, l.artSize, l.artSize)
 		} else {
-			fb.rect(l.margin, l.top, l.artSize, l.artSize, color.RGBA{25, 27, 34, 255})
+			fb.rect(l.margin, l.top, l.artSize, l.artSize, oledSurface(cfg, color.RGBA{25, 27, 34, 255}))
 			noArtScale := scaledFont(l.scale, 2)
 			label := "NO ALBUM ART"
 			fb.text(l.margin+(l.artSize-tw(noArtScale, label))/2, l.top+l.artSize/2-scaledPx(l.scale, 8), noArtScale, label, color.RGBA{130, 130, 135, 255})
@@ -4365,7 +4525,13 @@ func drawPlayerStatic(fb *framebuffer, p *Player, sel int, cfg *Config) playerLa
 	bodyScale := scaledFont(l.scale, 3)
 	metaGap := scaledPx(l.scale, 52)
 	bodyGap := scaledPx(l.scale, 36)
-	maxTitleChars := max(12, l.rightW/(6*titleScale))
+	// The clock's box is cleared after this: on a small screen the title sits
+	// at its height, so it must stop short of it.
+	titleW := l.rightW
+	if cx, cy, _, ch := clockBox(fb); l.top < cy+ch && l.rightX+titleW > cx-scaledPx(l.scale, 10) {
+		titleW = max(6*titleScale*12, cx-scaledPx(l.scale, 10)-l.rightX)
+	}
+	maxTitleChars := max(12, titleW/(6*titleScale))
 	fb.text(l.rightX, l.top, titleScale, short(t.Title, maxTitleChars), color.RGBA{250, 250, 250, 255})
 	metaY := l.top + metaGap
 	if t.Artist != "" {
@@ -4409,7 +4575,7 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 		cx := x + cellW/2
 		cy := l.ctrlY + boxH/2 - scaledPx(l.scale, 9)
 		if sel == i+1 {
-			fb.border(x+scaledPx(l.scale, 5), l.ctrlY-scaledPx(l.scale, 10), cellW-scaledPx(l.scale, 10), boxH, scaledPx(l.scale, 2), color.RGBA{255, 255, 255, 255})
+			fb.border(x+scaledPx(l.scale, 5), l.ctrlY-scaledPx(l.scale, 10), cellW-scaledPx(l.scale, 10), boxH, scaledPx(l.scale, 2), accentColour())
 		}
 		c := color.RGBA{225, 225, 230, 255}
 		switch i {
@@ -4461,7 +4627,7 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 	muteX := plusX + volButtonW + volGap
 	for _, b := range []struct{ sel, x int }{{8, minusX}, {9, plusX}, {10, muteX}} {
 		if sel == b.sel {
-			fb.border(b.x, volY, volButtonW, volH, scaledPx(l.scale, 2), color.RGBA{255, 255, 255, 255})
+			fb.border(b.x, volY, volButtonW, volH, scaledPx(l.scale, 2), accentColour())
 		}
 	}
 	cy := volY + volH/2
@@ -4484,22 +4650,8 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 	_, lv, _, _, paused, _, _, _, stopped := playerSnapshot(p)
 	vizPad := scaledPx(l.scale, 2)
 	fb.rect(l.rightX-vizPad, l.vizY-vizPad, l.rightW+vizPad*2, l.vizH+vizPad*2, bg)
-	barGap := scaledPx(l.scale, 12)
-	bw := (l.rightW - barGap*9) / 10
-	if bw < 2 {
-		bw = 2
-	}
-	if !stopped {
-		for i, v := range lv {
-			h := int(v * float64(l.vizH))
-			if h < 0 {
-				h = 0
-			}
-			if h > l.vizH {
-				h = l.vizH
-			}
-			fb.rect(l.rightX+i*(bw+barGap), l.vizY+l.vizH-h, bw, h, color.RGBA{225, 225, 230, 255})
-		}
+	if !stopped && !p.isLoading() {
+		drawVisualizer(fb, cfg.Visualizer, lv[:], l.rightX, l.vizY, l.rightW, l.vizH, l.scale, bg)
 	}
 	elapsed := p.elapsedNow()
 	duration := p.durationNow()
@@ -4510,19 +4662,27 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 	if duration > 0 {
 		timeTxt += fmt.Sprintf(" / %02d:%02d", int(duration.Minutes()), int(duration.Seconds())%60)
 	}
+	detail := ""
 	if p.isLoading() {
-		timeTxt = "DOWNLOADING PLEX TRACK..."
+		timeTxt, detail = p.preparationStatus()
 	} else if paused {
 		timeTxt += "   PAUSED"
 	}
-	fb.text(l.rightX, l.timeY, timeScale, timeTxt, color.RGBA{185, 185, 190, 255})
+	statusHeight := max(7, l.barY-scaledPx(l.scale, 12)-l.timeY)
+	for _, line := range playerStatusLines(timeTxt, detail, l.rightW, statusHeight, timeScale) {
+		fb.text(l.rightX, l.timeY+line.Y, line.Scale, line.Text, color.RGBA{185, 185, 190, 255})
+	}
+
 	barBoxPad := scaledPx(l.scale, 8)
 	barClearPad := barBoxPad + scaledPx(l.scale, 2)
 	fb.rect(l.rightX-barClearPad, l.barY-barClearPad, l.rightW+barClearPad*2, l.barH+barClearPad*2, bg)
 	if sel == 0 {
-		fb.border(l.rightX-barBoxPad, l.barY-barBoxPad, l.rightW+barBoxPad*2, l.barH+barBoxPad*2, scaledPx(l.scale, 2), color.RGBA{255, 255, 255, 255})
+		fb.border(l.rightX-barBoxPad, l.barY-barBoxPad, l.rightW+barBoxPad*2, l.barH+barBoxPad*2, scaledPx(l.scale, 2), accentColour())
 	}
-	fb.rect(l.rightX, l.barY, l.rightW, l.barH, color.RGBA{75, 75, 82, 255})
+	fb.rect(l.rightX, l.barY, l.rightW, l.barH, oledSurface(cfg, color.RGBA{75, 75, 82, 255}))
+	if cfg != nil && cfg.OLEDMode {
+		fb.border(l.rightX, l.barY, l.rightW, l.barH, 1, color.RGBA{75, 75, 82, 255})
+	}
 	fill := 0
 	if duration > 0 {
 		ratio := elapsed.Seconds() / duration.Seconds()
@@ -4534,7 +4694,7 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 		}
 		fill = int(float64(l.rightW) * ratio)
 	}
-	fb.rect(l.rightX, l.barY, fill, l.barH, color.RGBA{240, 240, 240, 255})
+	fb.rect(l.rightX, l.barY, fill, l.barH, accentColour())
 }
 
 func playerTrackKey(p *Player) string {
@@ -4542,8 +4702,8 @@ func playerTrackKey(p *Player) string {
 	p.mu.Lock()
 	detail := fmt.Sprintf("|%t|%s", p.loading, p.playbackError)
 	p.mu.Unlock()
-	return detail + fmt.Sprintf("%d|%s|%s|%s|%s|%d|%d|%d|%.3f|%t|%t|%t|%t|%t",
-		idx, t.Title, t.Artist, t.Album, t.MediaFormat, t.BitDepth, t.SampleRate, t.BitRate, t.Duration, t.Art != nil, paused, rep, repOne || shuf, stopped)
+	return detail + fmt.Sprintf("%d|%s|%s|%s|%s|%d|%d|%d|%.3f|%p|%t|%t|%t|%t",
+		idx, t.Title, t.Artist, t.Album, t.MediaFormat, t.BitDepth, t.SampleRate, t.BitRate, t.Duration, t.Art, paused, rep, repOne || shuf, stopped)
 }
 
 func playerUI(app *App) {
@@ -4559,7 +4719,8 @@ func playerUI(app *App) {
 	fb.present()
 	lastTrackKey := playerTrackKey(p)
 	lastClock := clockText(cfg)
-	vizTick := time.NewTicker(33 * time.Millisecond)
+	vizInterval := fpsInterval(cfg.FPSTarget)
+	vizTick := time.NewTicker(vizInterval)
 	metaTick := time.NewTicker(250 * time.Millisecond)
 	defer vizTick.Stop()
 	defer metaTick.Stop()
@@ -4765,6 +4926,14 @@ func playerUI(app *App) {
 				fb.presentRegion(l.margin, ctrlTop, fb.w-l.margin*2, fb.h-ctrlTop)
 			}
 		case <-vizTick.C:
+			interval := fpsInterval(cfg.FPSTarget)
+			if p.isLoading() {
+				interval = 250 * time.Millisecond
+			}
+			if interval != vizInterval {
+				vizInterval = interval
+				vizTick.Reset(interval)
+			}
 			drawPlayerDynamic(fb, p, l, sel, cfg)
 			fb.presentRegion(l.rightX-scaledPx(l.scale, 10), l.vizY-scaledPx(l.scale, 2), l.rightW+scaledPx(l.scale, 20), l.barY+l.barH-l.vizY+scaledPx(l.scale, 12))
 		case <-metaTick.C:
@@ -4802,20 +4971,20 @@ func eqUI(app *App) {
 	fb, acts, cfg := app.fb, app.acts, app.cfg
 	clockTick := time.NewTicker(30 * time.Second)
 	defer clockTick.Stop()
-	names := []string{"ENABLED", "PRESET", "BASS 60HZ", "LOW-MID 250HZ", "MID 1KHZ", "HIGH-MID 4KHZ", "TREBLE 12KHZ", "RESET FLAT"}
-	const rowPreset, rowReset = 1, 7
+	names := []string{"ENABLED", "PRESET", "BASS 60HZ", "LOW-MID 250HZ", "MID 1KHZ", "HIGH-MID 4KHZ", "TREBLE 12KHZ", "RESET FLAT", "VISUALIZER"}
+	const rowPreset, rowReset, rowVisualizer = 1, 7, 8
 	sel := 0
 	for {
 		fb.fill(appBackground(cfg))
 		drawTitle(fb, "EQUALIZER")
 		drawWebRemoteAddress(app)
-		vals := []string{onoff(cfg.EQ.Enabled), eqPresetName(cfg.EQ), fmt.Sprintf("%+.1F DB", cfg.EQ.Bass), fmt.Sprintf("%+.1F DB", cfg.EQ.LowMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Mid), fmt.Sprintf("%+.1F DB", cfg.EQ.HighMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Treble), ""}
-		row := max(26, fb.h/11)
+		vals := []string{onoff(cfg.EQ.Enabled), eqPresetName(cfg.EQ), fmt.Sprintf("%+.1F DB", cfg.EQ.Bass), fmt.Sprintf("%+.1F DB", cfg.EQ.LowMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Mid), fmt.Sprintf("%+.1F DB", cfg.EQ.HighMid), fmt.Sprintf("%+.1F DB", cfg.EQ.Treble), "", visualizerLabel(cfg.Visualizer)}
+		row := max(26, fb.h/12)
 		y := 70
 		for i, n := range names {
 			if i == sel {
-				fb.rect(40, y-5, fb.w-80, row-3, color.RGBA{34, 36, 45, 255})
-				fb.border(40, y-5, fb.w-80, row-3, 2, color.RGBA{245, 245, 245, 255})
+				fb.rect(40, y-5, fb.w-80, row-3, oledSurface(cfg, color.RGBA{34, 36, 45, 255}))
+				fb.border(40, y-5, fb.w-80, row-3, 2, accentColour())
 			}
 			fb.text(60, y+5, max(1, row/24), n, color.RGBA{235, 235, 235, 255})
 			if vals[i] != "" {
@@ -4876,16 +5045,22 @@ func eqUI(app *App) {
 				cycleEQPreset(&cfg.EQ, 1)
 			} else if sel == rowReset {
 				cfg.EQ = EQConfig{Enabled: cfg.EQ.Enabled}
+			} else if sel == rowVisualizer {
+				cfg.Visualizer = cycleVisualizer(cfg.Visualizer, 1)
 			}
 		case actLeft:
 			if sel == rowPreset {
 				cycleEQPreset(&cfg.EQ, -1)
+			} else if sel == rowVisualizer {
+				cfg.Visualizer = cycleVisualizer(cfg.Visualizer, -1)
 			} else {
 				adjustEQ(&cfg.EQ, sel, -0.5)
 			}
 		case actRight:
 			if sel == rowPreset {
 				cycleEQPreset(&cfg.EQ, 1)
+			} else if sel == rowVisualizer {
+				cfg.Visualizer = cycleVisualizer(cfg.Visualizer, 1)
 			} else {
 				adjustEQ(&cfg.EQ, sel, 0.5)
 			}
@@ -5063,18 +5238,18 @@ func cdIoctl(fd uintptr, req uintptr, arg unsafe.Pointer) error {
 	}
 	return nil
 }
-func readCDTOC(dev string) ([]Track, error) {
+func readCDTOCInfo(dev string) ([]Track, cdTOC, error) {
 	f, e := os.Open(dev)
 	if e != nil {
-		return nil, e
+		return nil, cdTOC{}, e
 	}
 	defer f.Close()
 	var h cdTOCHeader
 	if e = cdIoctl(f.Fd(), cdromReadTOCHdr, unsafe.Pointer(&h)); e != nil {
-		return nil, e
+		return nil, cdTOC{}, e
 	}
 	if h.First == 0 || h.Last < h.First {
-		return nil, errors.New("no audio CD detected")
+		return nil, cdTOC{}, errors.New("no audio CD detected")
 	}
 	type ent struct {
 		track uint8
@@ -5085,14 +5260,22 @@ func readCDTOC(dev string) ([]Track, error) {
 	for tr := h.First; tr <= h.Last; tr++ {
 		x := cdTOCEntry{Track: tr, Format: cdromLBAMode}
 		if e = cdIoctl(f.Fd(), cdromReadTOCEntry, unsafe.Pointer(&x)); e != nil {
-			return nil, e
+			return nil, cdTOC{}, e
 		}
 		es = append(es, ent{track: tr, lba: x.Addr, ctrl: (x.AdrCtrl >> 4) & 0x0f})
 	}
+	var toc cdTOC
+	toc.First, toc.Last = int(h.First), int(h.Last)
+	for _, x := range es {
+		if x.track < 100 {
+			toc.Offsets[x.track] = int(x.lba) + 150
+		}
+	}
 	lead := cdTOCEntry{Track: cdromLeadout, Format: cdromLBAMode}
 	if e = cdIoctl(f.Fd(), cdromReadTOCEntry, unsafe.Pointer(&lead)); e != nil {
-		return nil, e
+		return nil, cdTOC{}, e
 	}
+	toc.Offsets[0] = int(lead.Addr) + 150
 	var out []Track
 	for i, x := range es {
 		if x.ctrl&0x04 != 0 {
@@ -5103,12 +5286,17 @@ func readCDTOC(dev string) ([]Track, error) {
 			end = es[i+1].lba
 		}
 		dur := float64(end-x.lba) / 75.0
-		out = append(out, Track{Path: fmt.Sprintf("cdda:%s:%d:%d", dev, x.lba, end), Title: fmt.Sprintf("Track %02d", x.track), Album: "Audio CD", Duration: dur, MediaFormat: "CDDA", BitDepth: 16, SampleRate: 44100, BitRate: 1411})
+		out = append(out, Track{Path: fmt.Sprintf("cdda:%s:%d:%d", dev, x.lba, end), Number: int(x.track), Title: fmt.Sprintf("Track %02d", x.track), Album: "Audio CD", Duration: dur, MediaFormat: "CDDA", BitDepth: 16, SampleRate: 44100, BitRate: 1411})
 	}
 	if len(out) == 0 {
-		return nil, errors.New("disc contains no audio tracks")
+		return nil, cdTOC{}, errors.New("disc contains no audio tracks")
 	}
-	return out, nil
+	return out, toc, nil
+}
+
+func readCDTOC(dev string) ([]Track, error) {
+	tracks, _, err := readCDTOCInfo(dev)
+	return tracks, err
 }
 func currentReturnName(app *App, origin *browseOrigin) string {
 	if origin == nil {
@@ -5236,8 +5424,14 @@ func settingsUI(app *App) {
 	fb, acts, cfg := app.fb, app.acts, app.cfg
 	clockTick := time.NewTicker(30 * time.Second)
 	defer clockTick.Stop()
-	sel := 0
+	tab := 0
+	selected := [5]int{}
+	tabs := []string{"PLAYBACK", "APPEARANCE", "CONTROLS", "SYSTEM", "EXPERIMENTAL"}
+	rows := [][]int{{6, 24, 25}, {0, 1, 2, 3, 4, 5, 7, 9, 13}, {11, 12, 14, 15, 16, 17, 18, 19}, {8, 22, 23}, {10, 20, 21}}
+	sel := 6
 	labels := []string{
+		"VISUALIZER",
+		"ACCENT COLOUR",
 		"OLED MODE",
 		"SHOW ALBUM ART",
 		"AUTO HIDE MISSING ART",
@@ -5256,6 +5450,12 @@ func settingsUI(app *App) {
 		"HOLD TO REPEAT",
 		"HOLD DELAY",
 		"REPEAT INTERVAL",
+		"FPS TARGET (EXPERIMENTAL)",
+		"ENABLE GBA MUSIC",
+		"WEB REMOTE",
+		"SHOW WEB ADDRESS",
+		"VOLUME",
+		"MUTED",
 	}
 	fonts := scanCustomFonts()
 	applyCustomFont(cfg, fonts)
@@ -5264,25 +5464,23 @@ func settingsUI(app *App) {
 		fallbackFontHelp = "ADD .TTF OR .OTF FONTS TO THE MISTER HI-FI FONTS FOLDER"
 	}
 	enabled := func(i int) bool {
-		if i == 2 && cfg.HideAlbumArt {
+		if i == 4 && cfg.HideAlbumArt {
 			return false
 		}
-		if i == 11 && len(fonts) == 0 {
+		if i == 13 && len(fonts) == 0 {
 			return false
 		}
 		return true
 	}
 	move := func(from, dir int) int {
-		i := from
-		for {
-			i += dir
-			if i < 0 || i >= len(labels) {
-				return from
-			}
-			if enabled(i) {
-				return i
+		at := selected[tab]
+		for i := at + dir; i >= 0 && i < len(rows[tab]); i += dir {
+			if enabled(rows[tab][i]) {
+				selected[tab] = i
+				return rows[tab][i]
 			}
 		}
+		return from
 	}
 	for {
 		if app.jumpSources {
@@ -5291,15 +5489,25 @@ func settingsUI(app *App) {
 		fb.fill(appBackground(cfg))
 		drawTitle(fb, "SETTINGS")
 		drawWebRemoteAddress(app)
-		y0 := max(66, fb.h/15)
-		bottomReserve := max(82, fb.h/11)
-		row := (fb.h - y0 - bottomReserve) / len(labels)
-		if row < 40 {
-			row = 40
+		tabScale := max(1, min(2, fb.w/480))
+		tabW := (fb.w - 90) / len(tabs)
+		for i, name := range tabs {
+			c := color.RGBA{140, 140, 150, 255}
+			if i == tab {
+				c = accentColour()
+				fb.rect(45+i*tabW, 87, tabW-4, 2, c)
+			}
+			fb.text(50+i*tabW, 66, tabScale, name, c)
 		}
+		y0 := 102
+		bottomReserve := max(82, fb.h/11)
+		row := (fb.h - y0 - bottomReserve) / len(rows[tab])
+		row = max(44, min(row, 66))
 		visibleRows := max(1, (fb.h-y0-bottomReserve)/row)
-		first := max(0, sel-visibleRows+1)
+		first := max(0, selected[tab]-visibleRows+1)
 		values := []string{
+			visualizerLabel(cfg.Visualizer),
+			accentLabel(cfg.AccentColour),
 			onoff(cfg.OLEDMode),
 			onoff(!cfg.HideAlbumArt),
 			onoff(cfg.AutoHideMissingArt),
@@ -5318,14 +5526,21 @@ func settingsUI(app *App) {
 			onoff(cfg.Navigation.HoldRepeat),
 			fmt.Sprintf("%d MS", cfg.Navigation.DelayMS),
 			fmt.Sprintf("%d MS", cfg.Navigation.IntervalMS),
+			fpsTargetLabel(cfg.FPSTarget),
+			onoff(cfg.GBAMusicEnabled),
+			onoff(cfg.WebRemoteEnabled),
+			onoff(cfg.ShowWebAddress),
+			fmt.Sprintf("%d", cfg.Volume),
+			onoff(cfg.Muted),
 		}
 		ts := max(1, row/22)
-		for i := first; i < len(labels) && i < first+visibleRows; i++ {
-			y := y0 + (i-first)*row
+		for ri := first; ri < len(rows[tab]) && ri < first+visibleRows; ri++ {
+			i := rows[tab][ri]
+			y := y0 + (ri-first)*row
 			rowEnabled := enabled(i)
 			if sel == i && rowEnabled {
-				fb.rect(45, y-4, fb.w-90, row-3, color.RGBA{35, 37, 46, 255})
-				fb.border(45, y-4, fb.w-90, row-3, 2, color.RGBA{240, 240, 240, 255})
+				fb.rect(45, y-4, fb.w-90, row-3, oledSurface(cfg, color.RGBA{35, 37, 46, 255}))
+				fb.border(45, y-4, fb.w-90, row-3, 2, accentColour())
 			}
 			labelColor := color.RGBA{235, 235, 235, 255}
 			valueColor := color.RGBA{200, 200, 205, 255}
@@ -5335,35 +5550,47 @@ func settingsUI(app *App) {
 				valueColor = color.RGBA{75, 75, 82, 255}
 				subColor = color.RGBA{70, 70, 76, 255}
 			}
-			hasSub := i == 3 || i == 4 || i == 7 || i == 8 || i == 11
+			hasSub := i == 5 || i == 6 || i == 9 || i == 10 || i == 13 || i == 22
 			labelY := y + 5
 			if hasSub {
 				labelY = y + 1
 			}
-			fb.text(65, labelY, ts, labels[i], labelColor)
-			if i == 3 {
+			labelScale := ts
+			valueScale := ts
+			for valueScale > 1 && tw(valueScale, values[i]) > (fb.w-130)/2 {
+				valueScale--
+			}
+			labelWidth := fb.w - 150 - tw(valueScale, values[i])
+			for labelScale > 1 && tw(labelScale, labels[i]) > labelWidth {
+				labelScale--
+			}
+			fb.text(65, labelY, labelScale, short(labels[i], max(1, labelWidth/(6*labelScale))), labelColor)
+			if i == 5 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, "SKIPS EMBEDDED ARTWORK WHEN AN EXTERNAL COVER IS FOUND", subColor)
 			}
-			if i == 4 {
+			if i == 6 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, "RESTORES THE LAST SHUFFLE AND LOOP STATES FOR NEW PLAYBACK", subColor)
 			}
-			if i == 7 {
+			if i == 9 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, "TURNS THE DISPLAY COMPLETELY BLACK WHILE INACTIVE", subColor)
 			}
-			if i == 8 {
+			if i == 10 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, "FLAC / WAV / CDDA ONLY", subColor)
 			}
-			if i == 11 {
+			if i == 22 {
+				fb.text(65, labelY+ts*8, max(1, ts-1), "RESTART HI-FI AFTER CHANGING THIS OPTION", subColor)
+			}
+			if i == 13 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, fallbackFontHelp, subColor)
 			}
-			fb.text(fb.w-65-tw(ts, values[i]), y+5, ts, values[i], valueColor)
+			fb.text(fb.w-65-tw(valueScale, values[i]), y+5, valueScale, values[i], valueColor)
 		}
-		drawBrowserFooter(fb, false)
+		fb.text(50, fb.h-35, max(1, fb.w/480), "L/R: TABS   UP/DOWN: SELECT   LEFT/RIGHT: CHANGE   B: BACK", color.RGBA{185, 185, 195, 255})
 		drawClock(fb, cfg, appBackground(cfg))
 		fb.present()
 
@@ -5397,6 +5624,15 @@ func settingsUI(app *App) {
 		if a == actWake {
 			continue
 		}
+		if a == actPrev || a == actNext || a == actPageUp || a == actPageDown {
+			dir := 1
+			if a == actPrev || a == actPageUp {
+				dir = -1
+			}
+			tab = (tab + dir + len(tabs)) % len(tabs)
+			sel = rows[tab][selected[tab]]
+			continue
+		}
 		if app.handlePlaybackShortcut(a) {
 			continue
 		}
@@ -5417,20 +5653,49 @@ func settingsUI(app *App) {
 				continue
 			}
 			switch sel {
-			case 0:
-				cfg.OLEDMode = !cfg.OLEDMode
-			case 1:
-				cfg.HideAlbumArt = !cfg.HideAlbumArt
+			case 20:
+				if normalizeFPSTarget(cfg.FPSTarget) == 30 {
+					cfg.FPSTarget = 60
+				} else {
+					cfg.FPSTarget = 30
+				}
+			case 21:
+				cfg.GBAMusicEnabled = !cfg.GBAMusicEnabled
+				if !cfg.GBAMusicEnabled && app.player != nil {
+					if cur := app.player.current(); cur != nil && strings.HasPrefix(cur.Path, "gba:") {
+						app.player.stopPlaybackRaw()
+					}
+				}
+			case 22:
+				next := *cfg
+				next.WebRemoteEnabled = !next.WebRemoteEnabled
+				if err := app.applyWebConfig(next); err != nil {
+					message(app, "WEB REMOTE", err.Error())
+				}
+			case 23:
+				cfg.ShowWebAddress = !cfg.ShowWebAddress
+			case 24:
+				dir := 1
+				if a == actLeft {
+					dir = -1
+				}
+				app.stepVolume(dir)
+			case 25:
+				app.toggleMute()
 			case 2:
-				cfg.AutoHideMissingArt = !cfg.AutoHideMissingArt
+				cfg.OLEDMode = !cfg.OLEDMode
 			case 3:
+				cfg.HideAlbumArt = !cfg.HideAlbumArt
+			case 4:
+				cfg.AutoHideMissingArt = !cfg.AutoHideMissingArt
+			case 5:
 				cfg.PrioritizeExternalArt = !cfg.PrioritizeExternalArt
 				if app.player != nil {
 					app.player.mu.Lock()
 					app.player.cfg.PrioritizeExternalArt = cfg.PrioritizeExternalArt
 					app.player.mu.Unlock()
 				}
-			case 4:
+			case 6:
 				cfg.RememberShuffleLoop = !cfg.RememberShuffleLoop
 				if cfg.RememberShuffleLoop && app.player != nil {
 					app.player.mu.Lock()
@@ -5439,18 +5704,18 @@ func settingsUI(app *App) {
 					cfg.SavedLoopOne = app.player.q.RepeatOne
 					app.player.mu.Unlock()
 				}
-			case 5:
-				cfg.ShowClock = !cfg.ShowClock
-			case 6:
-				cfg.ConfirmOnExit = !cfg.ConfirmOnExit
 			case 7:
+				cfg.ShowClock = !cfg.ShowClock
+			case 8:
+				cfg.ConfirmOnExit = !cfg.ConfirmOnExit
+			case 9:
 				dir := 1
 				if a == actLeft {
 					dir = -1
 				}
 				cfg.ScreenSaverSeconds = cycleScreenSaver(cfg.ScreenSaverSeconds, dir)
 				screenSaverSeconds.Store(int64(cfg.ScreenSaverSeconds))
-			case 8:
+			case 10:
 				cfg.GaplessPlayback = !cfg.GaplessPlayback
 				if app.player != nil {
 					app.player.mu.Lock()
@@ -5460,37 +5725,55 @@ func settingsUI(app *App) {
 						app.player.prepareGaplessNextFile()
 					}
 				}
-			case 9:
+			case 11:
 				cfg.SwapAB = !cfg.SwapAB
 				swapABInput.Store(cfg.SwapAB)
-			case 10:
+			case 12:
 				cfg.SwapXY = !cfg.SwapXY
 				swapXYInput.Store(cfg.SwapXY)
-			case 12, 13, 16, 17:
+			case 14, 15, 18, 19:
 				dir := 1
 				if a == actLeft {
 					dir = -1
 				}
 				switch sel {
-				case 12:
+				case 14:
 					cfg.Navigation.Jump = cycleNavigationValue(cfg.Navigation.Jump, dir, []int{1, 5, 10, 25, 50, 100, 250, 500, 1000})
-				case 13:
+				case 15:
 					cfg.Navigation.PageJump = cycleNavigationValue(cfg.Navigation.PageJump, dir, []int{1, 5, 10, 25, 50, 100, 250, 500, 1000})
-				case 16:
+				case 18:
 					cfg.Navigation.DelayMS = cycleNavigationValue(cfg.Navigation.DelayMS, dir, []int{200, 300, 400, 500, 750, 1000})
-				case 17:
+				case 19:
 					cfg.Navigation.IntervalMS = cycleNavigationValue(cfg.Navigation.IntervalMS, dir, []int{50, 100, 150, 200, 250, 500, 1000})
 				}
-			case 14:
+			case 16:
 				cfg.Navigation.Wrap = !cfg.Navigation.Wrap
-			case 15:
+			case 17:
 				cfg.Navigation.HoldRepeat = !cfg.Navigation.HoldRepeat
-			case 11:
+			case 13:
 				dir := 1
 				if a == actLeft {
 					dir = -1
 				}
 				cycleCustomFont(cfg, fonts, dir)
+			case 0:
+				dir := 1
+				if a == actLeft {
+					dir = -1
+				}
+				cfg.Visualizer = cycleVisualizer(cfg.Visualizer, dir)
+			case 1:
+				if a == actConfirm {
+					if hex, ok := accentEditor(app, cfg.AccentColour); ok {
+						cfg.AccentColour = setAccent(hex)
+					}
+				} else {
+					dir := 1
+					if a == actLeft {
+						dir = -1
+					}
+					cfg.AccentColour = setAccent(cycleAccent(cfg.AccentColour, dir))
+				}
 			}
 			saveConfig(*cfg)
 		}
@@ -5506,7 +5789,7 @@ func physicalDisc(app *App) {
 	var tracks []Track
 	var err error
 	for _, d := range devs {
-		tracks, err = readCDTOC(d)
+		tracks, err = readCDTOCWithMetadata(d)
 		if err == nil && len(tracks) > 0 {
 			break
 		}
@@ -5587,7 +5870,7 @@ func onlineRadioUI(app *App) {
 			return
 		}
 		station := cfg.Stations[i]
-		t := Track{Path: station.URL, Title: station.Name, Album: "Online Radio", MediaFormat: "STREAM", DirFD: -1}
+		t := radioStationTrack(station)
 		q := Queue{Tracks: []Track{t}, Index: 0}
 		origin := &browseOrigin{Kind: "radio", Selected: station.Name}
 		if err := app.startQueue(q, origin); err != nil {
@@ -5601,6 +5884,14 @@ func onlineRadioUI(app *App) {
 		}
 		initial = i
 	}
+}
+
+// radioStationTrack is the track a radio station plays as: the station name and
+// logo are what the Monitor and the player show until a song title arrives.
+// Every way of starting a station (menu, web remote) builds it here.
+func radioStationTrack(station RadioStation) Track {
+	logo := radioLogo(station.Logo)
+	return Track{Path: station.URL, Title: station.Name, Album: "Online Radio", MediaFormat: "STREAM", DirFD: -1, Art: logo, RadioName: station.Name, RadioLogo: logo}
 }
 
 func sourcesUI(app *App) {
@@ -5619,12 +5910,19 @@ func sourcesUI(app *App) {
 			items = append(items, "SMB")
 			types = append(types, "smb")
 		}
-		items = append(items, "PLEX")
-		types = append(types, "plex")
+		// a media server shows up only once it is set up (Settings in the web remote)
+		for _, srv := range configuredMediaServers() {
+			items = append(items, srv.Label())
+			types = append(types, "srv:"+srv.ID())
+		}
 		items = append(items, "ONLINE RADIO")
 		types = append(types, "radio")
 		items = append(items, "VIRTUAL CD")
 		types = append(types, "virtualcd")
+		if app.cfg.GBAMusicEnabled && gameBoyAvailable() {
+			items = append(items, "GBA Music (Experimental)")
+			types = append(types, "gameboy")
+		}
 		if len(detectOptical()) > 0 {
 			items = append(items, "PHYSICAL DISC")
 			types = append(types, "disc")
@@ -5686,21 +5984,37 @@ func sourcesUI(app *App) {
 				continue
 			}
 			runBrowserSource(app, root, "smb")
-		case "plex":
-			plexUI(app)
 		case "radio":
 			onlineRadioUI(app)
 		case "virtualcd":
 			virtualCDUI(app)
+		case "gameboy":
+			gameBoyUI(app)
 		case "disc":
 			physicalDisc(app)
 		case "settings":
 			settingsUI(app)
+		default:
+			if id, ok := strings.CutPrefix(types[i], "srv:"); ok {
+				if srv := mediaServerByID(id); srv != nil {
+					mediaServerUI(app, srv)
+				}
+			}
 		}
 	}
 }
 
 func main() {
+	// say why the program ends: a signal (the launcher stops it when the core changes) or an exit
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		s := <-sigs
+		fmt.Fprintf(os.Stderr, "MiSTer Hi-Fi: received %v, exiting\n", s)
+		time.Sleep(50 * time.Millisecond)
+		signal.Reset()
+		syscall.Kill(syscall.Getpid(), s.(syscall.Signal))
+	}()
 	_ = os.MkdirAll(smbMountRoot, 0755)
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Println("MiSTer Hi-Fi v" + version)
@@ -5708,6 +6022,14 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--lastfm-auth" {
 		runLastFMAuthCLI()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--emby-login" {
+		runEmbyLoginCLI(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--jellyfin-login" {
+		runJellyfinLoginCLI(os.Args[2:])
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--send" {
@@ -5771,7 +6093,7 @@ func main() {
 	clearNowPlaying()
 	defer clearNowPlaying()
 	defer cleanupSMBMounts()
-	defer closePlexWorkers()
+	defer closeSrvWorkers()
 	defer func() {
 		if app.player != nil {
 			app.player.stopPlaybackRaw()
@@ -5791,6 +6113,7 @@ func main() {
 		}
 	}
 	sourcesUI(app)
+	fmt.Fprintln(os.Stderr, "MiSTer Hi-Fi: the sources menu was closed, exiting")
 }
 
 var _ = strconv.Itoa

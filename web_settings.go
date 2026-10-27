@@ -135,7 +135,10 @@ type settingsField struct {
 }
 
 func appSettingsFields() []settingsField {
-	fields := []settingsField{}
+	fields := []settingsField{
+		{Path: "fps_target", Label: "FPS Target (Experimental)", Type: "select", Group: "Experimental", Options: []settingsOption{{Value: 30, Label: "30 FPS (Default)"}, {Value: 60, Label: "60 FPS (Experimental)"}}},
+		{Path: "gba_music_enabled", Label: "Enable GBA Music (Experimental)", Type: "checkbox", Group: "Experimental"},
+	}
 	check := func(path, label, group string) {
 		fields = append(fields, settingsField{Path: path, Label: label, Type: "checkbox", Group: group})
 	}
@@ -148,6 +151,7 @@ func appSettingsFields() []settingsField {
 	check("auto_hide_missing_art", "Auto hide missing art", "Display")
 	check("prioritize_external_art", "Prioritize external cover art", "Display")
 	check("show_clock", "Show clock", "Display")
+	check("show_web_address", "Show web remote address", "Display")
 	opts := []settingsOption{}
 	for _, v := range screenSaverOptions {
 		opts = append(opts, settingsOption{Value: v, Label: screenSaverLabel(v)})
@@ -158,11 +162,16 @@ func appSettingsFields() []settingsField {
 		fonts = append(fonts, settingsOption{Value: font.File, Label: font.Name})
 	}
 	fields = append(fields, settingsField{Path: "custom_font", Label: "Custom fallback font", Type: "select", Group: "Display", Options: fonts, Help: "Used only for characters missing from the built-in font. Add .ttf or .otf files to the Hi-Fi fonts folder."})
-	fields = append(fields, settingsField{Path: "visualizer", Label: "Visualizer", Type: "select", Group: "Display", Options: []settingsOption{{Value: "bars", Label: "Spectrum bars"}}})
+	vizOpts := []settingsOption{}
+	for _, v := range visualizerStyles {
+		vizOpts = append(vizOpts, settingsOption{Value: v.ID, Label: v.Label})
+	}
+	fields = append(fields, settingsField{Path: "visualizer", Label: "Visualizer", Type: "select", Group: "Display", Options: vizOpts})
+	fields = append(fields, settingsField{Path: "accent_colour", Label: "Accent colour", Type: "color", Group: "Display", Help: "Selection frames, progress bar, spectrum bars and the accent LED visualizer."})
 	check("remember_shuffle_loop", "Remember shuffle / loop", "Playback")
 	check("confirm_on_exit", "Confirm on exit", "Playback")
 	check("gapless_playback", "Gapless playback (experimental)", "Playback")
-	fields[len(fields)-1].Help = "FLAC, WAV and CDDA only; Plex remains non-gapless."
+	fields[len(fields)-1].Help = "FLAC, WAV and CDDA; cached server FLAC/WAV tracks also support gapless playback."
 	number("volume", "Volume", "Playback", 0, 100, 1)
 	check("muted", "Muted", "Playback")
 	check("saved_shuffle", "Remembered shuffle", "Playback")
@@ -188,16 +197,20 @@ func appSettingsFields() []settingsField {
 		fields = append(fields, settingsField{Path: "lastfm." + field.key, Label: field.label, Type: field.kind, Group: "Last.fm", Help: ""})
 	}
 	fields[len(fields)-1].Help = "Blank credential fields keep saved values. Obtain a session key with mister_hifi --lastfm-auth."
+	check("listenbrainz.enabled", "Enable ListenBrainz", "ListenBrainz")
+	fields = append(fields, settingsField{Path: "listenbrainz.token", Label: "User token", Type: "password", Group: "ListenBrainz", Help: "From listenbrainz.org/profile. A blank field keeps the saved token."})
+	fields = append(fields, settingsField{Path: "listenbrainz.url", Label: "Server URL (optional)", Type: "text", Group: "ListenBrainz", Help: "Leave empty for listenbrainz.org; any server with the ListenBrainz API works."})
 	return fields
 }
 func redactAppConfig(c Config) Config {
+	c.ListenBrainz.Token = ""
 	c.LastFM.APIKey = ""
 	c.LastFM.APISecret = ""
 	c.LastFM.SessionKey = ""
 	return c
 }
 func settingsSnapshot(a *App) any {
-	return map[string]any{"config": redactAppConfig(*a.cfg), "fields": appSettingsFields(), "presets": eqPresets, "lastfm_configured": a.cfg.LastFM.ready(), "version": version}
+	return map[string]any{"config": redactAppConfig(*a.cfg), "fields": appSettingsFields(), "presets": eqPresets, "lastfm_configured": a.cfg.LastFM.ready(), "listenbrainz_configured": a.cfg.ListenBrainz.ready(), "version": version}
 }
 func mergeSettingsMap(dst, patch map[string]any) {
 	for key, value := range patch {
@@ -211,6 +224,7 @@ func mergeSettingsMap(dst, patch map[string]any) {
 	}
 }
 func patchedAppConfig(current Config, patch map[string]any) (Config, error) {
+	current.FPSTarget = normalizeFPSTarget(current.FPSTarget)
 	fields := appSettingsFields()
 	allowed := map[string]bool{}
 	for _, f := range fields {
@@ -248,6 +262,9 @@ func patchedAppConfig(current Config, patch map[string]any) (Config, error) {
 		return current, errors.New("settings have invalid values")
 	}
 	// Empty password inputs preserve the current credentials.
+	if next.ListenBrainz.Token == "" {
+		next.ListenBrainz.Token = current.ListenBrainz.Token
+	}
 	if next.LastFM.APIKey == "" {
 		next.LastFM.APIKey = current.LastFM.APIKey
 	}
@@ -304,7 +321,13 @@ func (a *App) applyWebConfig(next Config) error {
 	if err := settingsJSONWrite(appConfigPath, next); err != nil {
 		return errors.New("could not save app settings")
 	}
+	next.AccentColour = setAccent(next.AccentColour)
 	*a.cfg = next
+	if old.GBAMusicEnabled && !next.GBAMusicEnabled && a.player != nil {
+		if cur := a.player.current(); cur != nil && strings.HasPrefix(cur.Path, "gba:") {
+			a.player.stopPlaybackRaw()
+		}
+	}
 	applyCustomFont(a.cfg, scanCustomFonts())
 	swapABInput.Store(next.SwapAB)
 	swapXYInput.Store(next.SwapXY)

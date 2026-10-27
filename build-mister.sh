@@ -24,10 +24,13 @@ command -v go >/dev/null 2>&1 || {
 }
 
 ./fetch_libchdr.sh
+./build_agbplay.sh arm
 
 mkdir -p Scripts/.config/MiSTerHiFi
 cp radio.example.json Scripts/.config/MiSTerHiFi/radio.example.json
 cp plex.example.json Scripts/.config/MiSTerHiFi/plex.example.json
+cp jellyfin.example.json Scripts/.config/MiSTerHiFi/jellyfin.example.json
+cp emby.example.json Scripts/.config/MiSTerHiFi/emby.example.json
 
 command -v cargo >/dev/null 2>&1 || {
     echo "Error: Rust/Cargo is required for M4A (AAC/ALAC) support." >&2
@@ -40,12 +43,15 @@ rustup target add armv7-unknown-linux-gnueabihf >/dev/null 2>&1 || true
     CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER="$CC" cargo build --release --target armv7-unknown-linux-gnueabihf
 )
 
+# go does not notice a changed C++ library: its hash goes into the binary, so it is linked again
+GBA_STAMP=$(sha1sum third_party/agbplay-src/build-arm/libagbcore.a | cut -c1-12)
+
 GOOS=linux \
 GOARCH=arm \
 GOARM=7 \
 CGO_ENABLED=1 \
 CC="$CC" \
 CGO_LDFLAGS="${CGO_LDFLAGS:-} -latomic" \
-go build -trimpath -ldflags="-s -w" -o Scripts/.config/MiSTerHiFi/mister_hifi .
+go build -buildvcs=false -trimpath -ldflags="-s -w -X main.gbaLibStamp=$GBA_STAMP" -o Scripts/.config/MiSTerHiFi/mister_hifi .
 
 echo "Built Scripts/.config/MiSTerHiFi/mister_hifi"

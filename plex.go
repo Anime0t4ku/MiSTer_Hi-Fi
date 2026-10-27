@@ -2,31 +2,23 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-// Plex music source. Tracks are fetched from the Plex server into a small
-// temporary cache and played as local files, so seeking, tags and metadata
-// reuse SD/SMB playback. Gapless is disabled for Plex. Playback is reported to
-// Plex (timeline + scrobble), so Plex keeps the listening history and any
-// scrobbler that follows Plex sessions (e.g. multi-scrobbler) sees it.
-
-var plexTmpDir = "/tmp/misterhifi-plex"
+// Plex as a media server (mediaserver.go): the Plex-specific half. Playback is
+// reported to Plex (timeline + scrobble), so Plex keeps the listening history
+// and any scrobbler that follows Plex sessions (e.g. multi-scrobbler) sees it.
 
 const plexClientID = "misterhifi-mister-fpga"
 
@@ -97,8 +89,8 @@ func loadPlex() (PlexConfig, error) {
 	if c.Scrobbling == "" {
 		c.Scrobbling = "plex"
 	}
-	if c.Scrobbling != "plex" && c.Scrobbling != "lastfm" && c.Scrobbling != "none" {
-		return c, errors.New("scrobbling must be plex, lastfm, or none")
+	if c.Scrobbling != "plex" && !isOwnScrobbleMode(c.Scrobbling) && c.Scrobbling != "none" {
+		return c, errors.New("scrobbling must be plex, lastfm, listenbrainz, both, or none")
 	}
 	if c.MaxTrackMB == 0 {
 		c.MaxTrackMB = 128
@@ -151,7 +143,7 @@ func (c PlexConfig) request(path string, q url.Values) (*http.Request, error) {
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Plex-Token", c.Token)
-	req.Header.Set("X-Plex-Client-Identifier", plexDeviceID())
+	req.Header.Set("X-Plex-Client-Identifier", deviceID("plex-client-id", plexClientID))
 	req.Header.Set("X-Plex-Product", "MiSTer Hi-Fi")
 	req.Header.Set("X-Plex-Version", version)
 	req.Header.Set("X-Plex-Platform", "Linux")
@@ -227,10 +219,11 @@ func (c PlexConfig) musicSection() (string, error) {
 func plexTrack(m plexMeta) Track {
 	t := Track{
 		Path:     "plex:" + m.RatingKey,
-		PlexKey:  m.RatingKey,
+		SrvKey:   m.RatingKey,
 		Title:    m.Title,
 		Artist:   m.GrandparentTitle,
 		Album:    m.ParentTitle,
+		Number:   m.Index,
 		Duration: float64(m.Duration) / 1000,
 		DirFD:    -1,
 	}
@@ -238,8 +231,8 @@ func plexTrack(m plexMeta) Track {
 		md := m.Media[0]
 		t.BitRate = md.Bitrate
 		if len(md.Part) > 0 {
-			t.PlexPart = md.Part[0].Key
-			t.PlexExt = "." + strings.ToLower(md.Part[0].Container)
+			t.SrvPart = md.Part[0].Key
+			t.SrvExt = srvExtFromContainer(md.Part[0].Container)
 			for _, s := range md.Part[0].Stream {
 				if s.StreamType == 2 {
 					t.BitDepth = s.BitDepth
@@ -248,114 +241,177 @@ func plexTrack(m plexMeta) Track {
 			}
 		}
 	}
-	t.PlexThumb = m.ParentThumb
-	if t.PlexThumb == "" {
-		t.PlexThumb = m.Thumb
+	t.SrvThumb = m.ParentThumb
+	if t.SrvThumb == "" {
+		t.SrvThumb = m.Thumb
 	}
 	return t
 }
 
-// All cache mutation is serialized. Context cancellation releases queued jobs;
-// unique .part files are removed on every failure. Keys include the server and
-// media part so switching libraries/servers cannot play an unrelated cached file.
-var plexCacheGate = make(chan struct{}, 1)
-var plexWorkers sync.WaitGroup
+// ---- the media server ----
 
-func runPlexWorker(fn func()) { plexWorkers.Add(1); go func() { defer plexWorkers.Done(); fn() }() }
-func closePlexWorkers()       { plexWorkers.Wait(); _ = os.RemoveAll(plexTmpDir) }
-func cacheLock(ctx context.Context) error {
-	select {
-	case plexCacheGate <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+func plexItems(metas []plexMeta) []mediaItem {
+	out := make([]mediaItem, 0, len(metas))
+	for _, m := range metas {
+		if !plexID(m.RatingKey) {
+			continue
+		}
+		out = append(out, mediaItem{ID: m.RatingKey, Title: m.Title, Artist: m.ParentTitle})
 	}
+	return out
 }
-func cacheUnlock() { <-plexCacheGate }
-func plexCachePath(c PlexConfig, t Track) string {
-	ext := strings.ToLower(t.PlexExt)
-	if !supported[ext] {
-		ext = ".bin"
+
+func plexTracks(metas []plexMeta) []Track {
+	out := make([]Track, 0, len(metas))
+	for _, m := range metas {
+		if t := plexTrack(m); t.SrvPart != "" {
+			out = append(out, t)
+		}
 	}
-	sum := sha256.Sum256([]byte(c.Server + "\x00" + c.Token + "\x00" + t.PlexKey + "\x00" + t.PlexPart))
-	return filepath.Join(plexTmpDir, fmt.Sprintf("%x%s", sum[:16], ext))
+	return out
 }
-func plexEnsureLocal(ctx context.Context, cfg PlexConfig, t Track) (string, error) {
-	if t.PlexPart == "" {
-		return "", errors.New("plex: track has no media part")
+
+// plexServer is the mediaServer for Plex (config: plex.json).
+type plexServer struct{}
+
+func (plexServer) ID() string    { return "plex" }
+func (plexServer) Label() string { return "PLEX" }
+
+func (plexServer) Configured() bool {
+	_, err := os.Stat(plexConfigPath)
+	return err == nil
+}
+
+func (plexServer) Connect(ctx context.Context) (mediaSession, error) {
+	cfg, err := loadPlex()
+	if err != nil {
+		return nil, err
 	}
-	if err := cacheLock(ctx); err != nil {
-		return "", err
+	return &plexSession{cfg: cfg}, nil
+}
+
+// plexSession keeps the config it was made with (a snapshot).
+type plexSession struct {
+	cfg PlexConfig
+}
+
+func plexID(s string) bool {
+	if s == "" {
+		return false
 	}
-	defer cacheUnlock()
-	if err := ctx.Err(); err != nil {
-		return "", err
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
 	}
-	if err := os.MkdirAll(plexTmpDir, 0700); err != nil {
-		return "", err
+	return true
+}
+
+func (s *plexSession) ValidID(id string) bool { return plexID(id) }
+
+func (s *plexSession) section(ctx context.Context) (string, error) {
+	if s.cfg.Library != "" {
+		return s.cfg.Library, nil
 	}
-	dst := plexCachePath(cfg, t)
-	if st, err := os.Stat(dst); err == nil && st.Size() > 0 {
-		return dst, nil
-	}
-	req, err := cfg.request(t.PlexPart, url.Values{"download": {"1"}})
+	list, err := s.cfg.listContext(ctx, "/library/sections", nil, 0)
 	if err != nil {
 		return "", err
+	}
+	for _, sec := range list {
+		if sec.Type == "artist" {
+			return sec.Key, nil
+		}
+	}
+	return "", errors.New("no music library on Plex server")
+}
+
+func (s *plexSession) Artists(ctx context.Context) ([]mediaItem, error) {
+	sec, err := s.section(ctx)
+	if err != nil {
+		return nil, err
+	}
+	m, err := s.cfg.listContext(ctx, "/library/sections/"+sec+"/all", url.Values{"type": {"8"}, "sort": {"titleSort"}}, 0)
+	return plexItems(m), err
+}
+
+func (s *plexSession) ArtistAlbums(ctx context.Context, id string) ([]mediaItem, error) {
+	m, err := s.cfg.listContext(ctx, "/library/metadata/"+id+"/children", nil, 0)
+	return plexItems(m), err
+}
+
+func (s *plexSession) Albums(ctx context.Context, recent bool) ([]mediaItem, error) {
+	sec, err := s.section(ctx)
+	if err != nil {
+		return nil, err
+	}
+	q, max := url.Values{"type": {"9"}, "sort": {"artist.titleSort,titleSort"}}, 0
+	if recent {
+		q, max = url.Values{"type": {"9"}, "sort": {"addedAt:desc"}}, 100
+	}
+	m, err := s.cfg.listContext(ctx, "/library/sections/"+sec+"/all", q, max)
+	return plexItems(m), err
+}
+
+func (s *plexSession) Playlists(ctx context.Context) ([]mediaItem, error) {
+	m, err := s.cfg.listContext(ctx, "/playlists", url.Values{"playlistType": {"audio"}}, 0)
+	return plexItems(m), err
+}
+
+func (s *plexSession) AlbumTracks(ctx context.Context, id string) ([]Track, error) {
+	m, err := s.cfg.listContext(ctx, "/library/metadata/"+id+"/children", nil, 0)
+	return plexTracks(m), err
+}
+
+func (s *plexSession) PlaylistTracks(ctx context.Context, id string) ([]Track, error) {
+	m, err := s.cfg.listContext(ctx, "/playlists/"+id+"/items", nil, 0)
+	return plexTracks(m), err
+}
+
+func (s *plexSession) FindAlbum(ctx context.Context, query string) (mediaItem, error) {
+	sec, err := s.section(ctx)
+	if err != nil {
+		return mediaItem{}, err
+	}
+	albums, err := s.cfg.listContext(ctx, "/library/sections/"+sec+"/search", url.Values{"type": {"9"}, "query": {query}}, 1)
+	if err != nil {
+		return mediaItem{}, err
+	}
+	items := plexItems(albums)
+	if len(items) == 0 {
+		return mediaItem{}, errors.New("no album found")
+	}
+	return items[0], nil
+}
+
+func (s *plexSession) Download(ctx context.Context, t Track) (io.ReadCloser, int64, error) {
+	req, err := s.cfg.request(t.SrvPart, url.Values{"download": {"1"}})
+	if err != nil {
+		return nil, 0, err
 	}
 	req.Header.Del("Accept")
-	resp, err := cfg.client(5 * time.Minute).Do(req.WithContext(ctx))
+	resp, err := s.cfg.client(5 * time.Minute).Do(req.WithContext(ctx))
 	if err != nil {
-		return "", err
+		return nil, 0, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("plex: download failed (HTTP %d)", resp.StatusCode)
+		resp.Body.Close()
+		return nil, 0, fmt.Errorf("plex: download failed (HTTP %d)", resp.StatusCode)
 	}
-	limit := cfg.MaxTrackMB
-	if limit == 0 {
-		limit = 128
-	}
-	limit *= 1 << 20
-	if resp.ContentLength > limit {
-		return "", fmt.Errorf("plex: track exceeds %d MB cache limit", limit>>20)
-	}
-	f, err := os.CreateTemp(plexTmpDir, "download-*.part")
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(f.Name())
-	n, copyErr := io.Copy(f, io.LimitReader(resp.Body, limit+1))
-	closeErr := f.Close()
-	if copyErr != nil {
-		return "", copyErr
-	}
-	if closeErr != nil {
-		return "", closeErr
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	if n == 0 || n > limit || (resp.ContentLength >= 0 && n != resp.ContentLength) {
-		return "", errors.New("plex: empty, incomplete, or oversized download")
-	}
-	if err := os.Rename(f.Name(), dst); err != nil {
-		return "", err
-	}
-	return dst, nil
+	return resp.Body, resp.ContentLength, nil
 }
 
-func plexArt(ctx context.Context, cfg PlexConfig, t Track) image.Image {
-	if t.PlexThumb == "" {
+func (s *plexSession) Art(ctx context.Context, t Track) image.Image {
+	if t.SrvThumb == "" {
 		return nil
 	}
-	req, err := cfg.request("/photo/:/transcode", url.Values{
-		"url": {t.PlexThumb}, "width": {"600"}, "height": {"600"}, "minSize": {"1"},
+	req, err := s.cfg.request("/photo/:/transcode", url.Values{
+		"url": {t.SrvThumb}, "width": {"600"}, "height": {"600"}, "minSize": {"1"},
 	})
 	if err != nil {
 		return nil
 	}
 	req.Header.Del("Accept")
-	resp, err := cfg.client(20 * time.Second).Do(req.WithContext(ctx))
+	resp, err := s.cfg.client(20 * time.Second).Do(req.WithContext(ctx))
 	if err != nil {
 		return nil
 	}
@@ -370,16 +426,12 @@ func plexArt(ctx context.Context, cfg PlexConfig, t Track) image.Image {
 	return im
 }
 
-func plexReport(ctx context.Context, cfg PlexConfig, t Track, state string, pos time.Duration) error {
-	q := url.Values{"ratingKey": {t.PlexKey}, "key": {"/library/metadata/" + t.PlexKey}, "state": {state}, "time": {fmt.Sprint(pos.Milliseconds())}, "duration": {fmt.Sprint(int64(t.Duration * 1000))}}
-	return plexSend(ctx, cfg, "/:/timeline", q)
-}
-func plexSend(ctx context.Context, cfg PlexConfig, path string, q url.Values) error {
-	req, err := cfg.request(path, q)
+func (s *plexSession) send(ctx context.Context, path string, q url.Values) error {
+	req, err := s.cfg.request(path, q)
 	if err != nil {
 		return err
 	}
-	resp, err := cfg.client(8 * time.Second).Do(req.WithContext(ctx))
+	resp, err := s.cfg.client(8 * time.Second).Do(req.WithContext(ctx))
 	if err != nil {
 		return err
 	}
@@ -390,537 +442,26 @@ func plexSend(ctx context.Context, cfg PlexConfig, path string, q url.Values) er
 	}
 	return nil
 }
-func plexScrobble(ctx context.Context, cfg PlexConfig, t Track) error {
-	return plexSend(ctx, cfg, "/:/scrobble", url.Values{"key": {t.PlexKey}, "identifier": {"com.plexapp.plugins.library"}})
+
+func (s *plexSession) Report(ctx context.Context, t Track, state string, pos time.Duration) error {
+	q := url.Values{"ratingKey": {t.SrvKey}, "key": {"/library/metadata/" + t.SrvKey}, "state": {state}, "time": {fmt.Sprint(pos.Milliseconds())}, "duration": {fmt.Sprint(int64(t.Duration * 1000))}}
+	return s.send(ctx, "/:/timeline", q)
 }
 
-// Listen time follows wall time only while this generation is actually playing.
-// Seeking changes the timeline position, never the time used to qualify a play.
-func plexPlayedEnough(t Track, heard time.Duration) bool {
-	threshold := 4 * time.Minute
-	if t.Duration > 0 && time.Duration(t.Duration*float64(time.Second)/2) < threshold {
-		threshold = time.Duration(t.Duration * float64(time.Second) / 2)
-	}
-	return heard >= threshold
-}
-func (p *Player) plexSession(t Track, stop <-chan struct{}, generation uint64) {
-	cfg, err := trackPlexConfig(t)
-	if err != nil {
-		return
-	}
-	ctx, cancel := playbackContext(stop)
-	defer cancel()
-	startedAt := time.Now()
-	type update struct {
-		state      string
-		pos, heard time.Duration
-	}
-	updates := make(chan update, 1)
-	networkDone := make(chan struct{})
-	p.mu.Lock()
-	lastfmCfg := p.cfg.LastFM
-	p.mu.Unlock()
-	go func() {
-		defer close(networkDone)
-		lastState := ""
-		lastReport := time.Time{}
-		scrobbled, warned := false, false
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case u := <-updates:
-				if ctx.Err() != nil {
-					return
-				}
-				var reportErr error
-				if u.state != lastState || time.Since(lastReport) >= 10*time.Second {
-					reportErr = plexReport(ctx, cfg, t, u.state, u.pos)
-					lastState = u.state
-					lastReport = time.Now()
-				}
-				if !scrobbled && plexPlayedEnough(t, u.heard) {
-					switch cfg.Scrobbling {
-					case "plex", "":
-						reportErr = plexScrobble(ctx, cfg, t)
-					case "lastfm":
-						reportErr = scrobblePlexLastFM(lastfmCfg, t, startedAt)
-					default:
-						reportErr = nil
-					}
-					scrobbled = reportErr == nil
-				}
-				if reportErr != nil && ctx.Err() == nil && !warned {
-					log.Printf("Plex playback reporting: %v", reportErr)
-					warned = true
-				}
-			}
-		}
-	}()
-	tick := time.NewTicker(time.Second)
-	defer tick.Stop()
-	var pos, heard time.Duration
-	last := time.Now()
-	wasPlaying := false
-	defer func() {
-		cancel()
-		<-networkDone
-		endCtx, endCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer endCancel()
-		if err := plexReport(endCtx, cfg, t, "stopped", pos); err != nil {
-			log.Printf("Plex stopped report: %v", err)
-		}
-	}()
-	for {
-		p.opMu.Lock()
-		p.mu.Lock()
-		valid := p.stop == stop && p.generation == generation && !p.stopped
-		paused := p.paused
-		p.mu.Unlock()
-		if !valid {
-			p.opMu.Unlock()
-			return
-		}
-		pos = p.elapsedNow()
-		p.opMu.Unlock()
-		now := time.Now()
-		if wasPlaying && !paused {
-			heard += now.Sub(last)
-		}
-		last = now
-		wasPlaying = !paused
-		state := "playing"
-		if paused {
-			state = "paused"
-		}
-		u := update{state: state, pos: pos, heard: heard}
-		// Keep the newest snapshot when reporting is slow, without delaying sampling.
-		select {
-		case updates <- u:
-		default:
-			select {
-			case <-updates:
-			default:
-			}
-			select {
-			case updates <- u:
-			default:
-			}
-		}
-		select {
-		case <-stop:
-			return
-		case <-tick.C:
-		}
-	}
+func (s *plexSession) Played(ctx context.Context, t Track) error {
+	return s.send(ctx, "/:/scrobble", url.Values{"key": {t.SrvKey}, "identifier": {"com.plexapp.plugins.library"}})
 }
 
-// ---- UI ----
-
-func plexUI(app *App) {
-	cfg, err := loadPlex()
-	if err != nil {
-		if os.IsNotExist(err) {
-			message(app, "PLEX", "CONFIGURE PLEX IN WEB REMOTE > PLEX SETTINGS")
-		} else {
-			message(app, "PLEX", strings.ToUpper(err.Error()))
-		}
-		return
+// Scrobbling maps plex.json's "plex" (the server counts) onto the generic "server".
+func (s *plexSession) Scrobbling() string {
+	if s.cfg.Scrobbling == "plex" || s.cfg.Scrobbling == "" {
+		return "server"
 	}
-	sec, err := cfg.musicSection()
-	if err != nil {
-		message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-		return
-	}
-	initial := 0
-	for {
-		i, ok := menu(app, "PLEX", []string{"ARTISTS", "ALBUMS", "RECENT ALBUMS", "PLAYLISTS"}, initial)
-		if !ok {
-			return
-		}
-		initial = i
-		switch i {
-		case 0:
-			plexArtistsUI(app, cfg, sec)
-		case 1:
-			plexAllAlbumsUI(app, cfg, sec)
-		case 2:
-			plexRecentUI(app, cfg, sec)
-		case 3:
-			plexPlaylistsUI(app, cfg)
-		}
-		if app.jumpSources {
-			return
-		}
-	}
+	return s.cfg.Scrobbling
 }
 
-func plexArtistsUI(app *App, cfg PlexConfig, sec string) {
-	artists, err := cfg.list("/library/sections/"+sec+"/all", url.Values{"type": {"8"}, "sort": {"titleSort"}}, 0)
-	if err != nil {
-		message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-		return
-	}
-	if len(artists) == 0 {
-		message(app, "PLEX", "NO ARTISTS")
-		return
-	}
-	names := make([]string, len(artists))
-	for i, a := range artists {
-		names[i] = a.Title
-	}
-	initial := 0
-	for {
-		i, ok := menuWithEntryCounter(app, "PLEX - ARTISTS", names, initial, true)
-		if !ok {
-			return
-		}
-		initial = i
-		albums, err := cfg.list("/library/metadata/"+artists[i].RatingKey+"/children", nil, 0)
-		if err != nil {
-			message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-			continue
-		}
-		plexAlbumsUI(app, cfg, artists[i].Title, albums, false)
-		if app.jumpSources {
-			return
-		}
-	}
-}
+func (s *plexSession) MaxTrackBytes() int64 { return s.cfg.MaxTrackMB << 20 }
 
-func plexAllAlbumsUI(app *App, cfg PlexConfig, sec string) {
-	albums, err := cfg.list("/library/sections/"+sec+"/all", url.Values{"type": {"9"}, "sort": {"artist.titleSort,titleSort"}}, 0)
-	if err != nil {
-		message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-		return
-	}
-	plexAlbumsUI(app, cfg, "ALBUMS", albums, true)
-}
-
-func plexRecentUI(app *App, cfg PlexConfig, sec string) {
-	albums, err := cfg.list("/library/sections/"+sec+"/all", url.Values{"type": {"9"}, "sort": {"addedAt:desc"}}, 100)
-	if err != nil {
-		message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-		return
-	}
-	plexAlbumsUI(app, cfg, "RECENT ALBUMS", albums, true)
-}
-
-func plexAlbumsUI(app *App, cfg PlexConfig, title string, albums []plexMeta, withArtist bool) {
-	if len(albums) == 0 {
-		message(app, "PLEX", "NO ALBUMS")
-		return
-	}
-	names := make([]string, len(albums))
-	for i, a := range albums {
-		names[i] = a.Title
-		if withArtist && a.ParentTitle != "" {
-			names[i] = a.ParentTitle + " - " + a.Title
-		}
-	}
-	initial := 0
-	for {
-		i, ok := menuWithEntryCounter(app, "PLEX - "+title, names, initial, true)
-		if !ok {
-			return
-		}
-		initial = i
-		tracks, err := cfg.list("/library/metadata/"+albums[i].RatingKey+"/children", nil, 0)
-		if err != nil {
-			message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-			continue
-		}
-		plexTracksUI(app, cfg, albums[i].Title, tracks, false)
-		if app.jumpSources {
-			return
-		}
-	}
-}
-
-func plexPlaylistsUI(app *App, cfg PlexConfig) {
-	lists, err := cfg.list("/playlists", url.Values{"playlistType": {"audio"}}, 0)
-	if err != nil {
-		message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-		return
-	}
-	if len(lists) == 0 {
-		message(app, "PLEX", "NO PLAYLISTS")
-		return
-	}
-	names := make([]string, len(lists))
-	for i, l := range lists {
-		names[i] = l.Title
-	}
-	initial := 0
-	for {
-		i, ok := menuWithEntryCounter(app, "PLEX - PLAYLISTS", names, initial, true)
-		if !ok {
-			return
-		}
-		initial = i
-		tracks, err := cfg.list("/playlists/"+lists[i].RatingKey+"/items", nil, 0)
-		if err != nil {
-			message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-			continue
-		}
-		plexTracksUI(app, cfg, lists[i].Title, tracks, true)
-		if app.jumpSources {
-			return
-		}
-	}
-}
-
-func plexTracksUI(app *App, cfg PlexConfig, title string, metas []plexMeta, withArtist bool) {
-	var tracks []Track
-	var names []string
-	for _, m := range metas {
-		t := plexTrack(m)
-		t.PlexSource = &cfg
-		if t.PlexPart == "" {
-			continue
-		}
-		tracks = append(tracks, t)
-		name := m.Title
-		if withArtist && m.GrandparentTitle != "" {
-			name = m.GrandparentTitle + " - " + m.Title
-		} else if m.Index > 0 {
-			name = fmt.Sprintf("%02d  %s", m.Index, m.Title)
-		}
-		names = append(names, name)
-	}
-	if len(tracks) == 0 {
-		message(app, "PLEX", "NO TRACKS")
-		return
-	}
-	initial := 0
-	for {
-		i, ok := menuWithEntryCounter(app, "PLEX - "+title, names, initial, true)
-		if !ok {
-			return
-		}
-		initial = i
-		q := Queue{Tracks: append([]Track{}, tracks...), Index: i}
-		origin := &browseOrigin{Kind: "plex", Selected: names[i]}
-		if err := app.startQueue(q, origin); err != nil {
-			message(app, "PLEX ERROR", strings.ToUpper(err.Error()))
-			continue
-		}
-		playerUI(app)
-		if app.jumpSources {
-			return
-		}
-		if t := app.player; t != nil {
-			t.mu.Lock()
-			if t.q.Index >= 0 && t.q.Index < len(names) && len(t.q.Tracks) == len(tracks) {
-				// keep the cursor on the track that was playing when we left
-				initial = t.q.Index
-			}
-			t.mu.Unlock()
-		}
-	}
-}
-
-// Playback and prefetch share the shuffle choice; the plan is invalidated by
-// changing repeat/shuffle settings or moving to another index.
-type plexNextPlan struct {
-	from, next           int
-	shuffle, repeat, one bool
-	valid                bool
-}
-
-func (p *Player) plexNextLocked(manual bool) int {
-	q := &p.q
-	n := len(q.Tracks)
-	if n == 0 {
-		return -1
-	}
-	if !manual && q.Repeat && q.RepeatOne {
-		return q.Index
-	}
-	if q.Shuffle && n > 1 {
-		if q.Tracks[q.Index].PlexKey == "" {
-			next := int(time.Now().UnixNano() % int64(n-1))
-			if next >= q.Index {
-				next++
-			}
-			return next
-		}
-		plan := &p.plexPlan
-		if !plan.valid || plan.from != q.Index || plan.shuffle != q.Shuffle || plan.repeat != q.Repeat || plan.one != q.RepeatOne {
-			next := int(time.Now().UnixNano() % int64(n-1))
-			if next >= q.Index {
-				next++
-			}
-			*plan = plexNextPlan{from: q.Index, next: next, shuffle: q.Shuffle, repeat: q.Repeat, one: q.RepeatOne, valid: true}
-		}
-		return plan.next
-	}
-	if q.Index+1 < n {
-		return q.Index + 1
-	}
-	if q.Repeat || manual {
-		return 0
-	}
-	return -1
-}
-func (p *Player) isLoading() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.loading }
-func playbackContext(stop <-chan struct{}) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-stop:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx, cancel
-}
-func (p *Player) preparePlexTrack(ctx context.Context, t Track, idx int, stop chan struct{}, generation uint64, cfg Config) {
-	plexCfg, err := trackPlexConfig(t)
-	local := ""
-	if err == nil {
-		local, err = plexEnsureLocal(ctx, plexCfg, t)
-	}
-	p.opMu.Lock()
-	defer p.opMu.Unlock()
-	p.mu.Lock()
-	if p.stop != stop || p.generation != generation || ctx.Err() != nil {
-		p.mu.Unlock()
-		return
-	}
-	p.loading = false
-	if err != nil {
-		p.playbackError = err.Error()
-		p.stopped = true
-		close(stop)
-		p.stop = nil
-		p.mu.Unlock()
-		clearNowPlaying()
-		log.Printf("Plex playback: %v", err)
-		return
-	}
-	t.Path = local
-	t.PlexSource = &plexCfg
-	p.q.Tracks[idx] = t
-	paused := p.paused
-	p.mu.Unlock()
-	if err := p.startPreparedTrackUnlocked(t, idx, stop, generation, cfg); err != nil {
-		log.Printf("Plex audio: %v", err)
-		return
-	}
-	nativeAudioPause(paused)
-}
-func (p *Player) plexArtwork(t Track, idx int, stop <-chan struct{}, generation uint64) {
-	ctx, cancel := playbackContext(stop)
-	defer cancel()
-	cfg, err := trackPlexConfig(t)
-	if err != nil {
-		return
-	}
-	art := plexArt(ctx, cfg, t)
-	if art == nil || ctx.Err() != nil {
-		return
-	}
-	p.mu.Lock()
-	valid := p.stop == stop && p.generation == generation && idx == p.q.Index
-	if valid && p.q.Tracks[idx].Art == nil {
-		p.q.Tracks[idx].Art = art
-	}
-	p.mu.Unlock()
-	if valid {
-		p.publishCurrent()
-	}
-}
-func (p *Player) plexPrefetch(idx int, cur Track, stop <-chan struct{}, generation uint64) {
-	ctx, cancel := playbackContext(stop)
-	defer cancel()
-	cfg, err := trackPlexConfig(cur)
-	if err != nil {
-		return
-	}
-	p.mu.Lock()
-	nextIndex := p.plexNextLocked(false)
-	var next Track
-	if nextIndex >= 0 {
-		next = p.q.Tracks[nextIndex]
-	}
-	p.mu.Unlock()
-	keep := map[string]bool{plexCachePath(cfg, cur): true}
-	if next.PlexKey != "" {
-		keep[plexCachePath(cfg, next)] = true
-	}
-	if !p.plexTrimCache(ctx, keep, stop, generation) {
-		return
-	}
-	if next.PlexKey != "" {
-		if _, err := plexEnsureLocal(ctx, cfg, next); err != nil && ctx.Err() == nil {
-			log.Printf("Plex prefetch: %v", err)
-		}
-	}
-}
-func (p *Player) plexTrimCache(ctx context.Context, keep map[string]bool, stop <-chan struct{}, generation uint64) bool {
-	if err := cacheLock(ctx); err != nil {
-		return false
-	}
-	defer cacheUnlock()
-	p.opMu.Lock()
-	defer p.opMu.Unlock()
-	p.mu.Lock()
-	valid := p.stop == stop && p.generation == generation && !p.stopped
-	p.mu.Unlock()
-	if !valid || ctx.Err() != nil {
-		return false
-	}
-	entries, _ := os.ReadDir(plexTmpDir)
-	for _, entry := range entries {
-		path := filepath.Join(plexTmpDir, entry.Name())
-		if !keep[path] {
-			_ = os.Remove(path)
-		}
-	}
-	return true
-}
-
-var plexIDMu sync.Mutex
-var plexIDCache string
-
-func plexDeviceID() string {
-	plexIDMu.Lock()
-	defer plexIDMu.Unlock()
-	if plexIDCache != "" {
-		return plexIDCache
-	}
-	path := filepath.Join(baseDir, "plex-client-id")
-	if b, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(b)) != "" {
-		plexIDCache = strings.TrimSpace(string(b))
-		return plexIDCache
-	}
-	// Kernel boot ID gives a per-machine fallback even if the SD card is read-only.
-	b, _ := os.ReadFile("/proc/sys/kernel/random/uuid")
-	id := strings.TrimSpace(string(b))
-	if id == "" {
-		host, _ := os.Hostname()
-		id = host + "-" + strconv.FormatInt(time.Now().UnixNano(), 16)
-	}
-	id = plexClientID + "-" + id
-	_ = os.MkdirAll(baseDir, 0755)
-	_ = os.WriteFile(path, []byte(id), 0600)
-	plexIDCache = id
-	return id
-}
-
-func scrobblePlexLastFM(cfg LastFMConfig, t Track, startedAt time.Time) error {
-	if !cfg.ready() {
-		return nil
-	}
-	params := map[string]string{"api_key": cfg.APIKey, "sk": cfg.SessionKey, "track": t.Title, "artist": nonEmptyOr(t.Artist, "Unknown Artist"), "album": t.Album, "timestamp": strconv.FormatInt(startedAt.Unix(), 10)}
-	_, err := lastfmCall("track.scrobble", params, cfg.APISecret, http.MethodPost)
-	return err
-}
-
-func trackPlexConfig(t Track) (PlexConfig, error) {
-	if t.PlexSource != nil {
-		return *t.PlexSource, nil
-	}
-	return loadPlex()
+func (s *plexSession) CacheKey(t Track) string {
+	return s.cfg.Server + "\x00" + s.cfg.Token + "\x00" + t.SrvKey + "\x00" + t.SrvPart
 }

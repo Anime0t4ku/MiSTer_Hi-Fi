@@ -238,6 +238,8 @@ func (w *webRemote) handleSourceTest(rw http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Kind     string            `json:"kind"`
 		Plex     *PlexConfig       `json:"plex"`
+		Jellyfin *JellyfinConfig   `json:"jellyfin"`
+		Emby     *JellyfinConfig   `json:"emby"`
 		SMB      *smbSettingsEntry `json:"smb"`
 		Radio    *RadioStation     `json:"radio"`
 		Revision string            `json:"revision"`
@@ -284,6 +286,34 @@ func (w *webRemote) handleSourceTest(rw http.ResponseWriter, r *http.Request) {
 				err = errors.New("server connected, but no matching music library was found")
 			}
 		}
+	case "jellyfin", "emby":
+		emby := request.Kind == "emby"
+		jf := request.Jellyfin
+		if emby {
+			jf = request.Emby
+		}
+		if jf == nil {
+			http.Error(rw, request.Kind+" settings required", 400)
+			return
+		}
+		cfg := *jf
+		cfg.emby = emby
+		cfg.Server = strings.TrimRight(strings.TrimSpace(cfg.Server), "/")
+		if !isHTTPURL(cfg.Server) {
+			http.Error(rw, cfg.name()+" server required", 400)
+			return
+		}
+		old, _ := loadJFRaw(emby)
+		if cfg.Server == strings.TrimRight(old.Server, "/") {
+			cfg.Token, cfg.UserID = old.Token, old.UserID
+		} else {
+			cfg.Token, cfg.UserID = "", ""
+		}
+		if cfg.Library != "" && !jellyfinID(cfg.Library) {
+			http.Error(rw, cfg.name()+" library must be a library id", 400)
+			return
+		}
+		err = testJellyfinConnection(ctx, cfg)
 	case "smb":
 		if request.SMB == nil {
 			http.Error(rw, "SMB settings required", 400)

@@ -21,9 +21,9 @@ const webSettingsJS = `
 (()=>{
 'use strict';
 const dialog=document.createElement('dialog');dialog.id='settingsDialog';dialog.setAttribute('aria-labelledby','settingsTitle');
-dialog.innerHTML='<header class="settings-header"><h2 id="settingsTitle">Settings</h2><button type="button" id="settingsClose" aria-label="Close settings">Close</button></header><nav class="settings-tabs" aria-label="Settings sections"><button type="button" data-settings-tab="app" aria-selected="true">App Settings</button><button type="button" data-settings-tab="sources" aria-selected="false">Source Settings</button></nav><div class="settings-scroll"><section id="appSettingsPanel" class="settings-panel"></section><section id="sourceSettingsPanel" class="settings-panel" hidden><nav class="settings-tabs" aria-label="Source settings"><button type="button" data-source-tab="plex" aria-selected="true">Plex</button><button type="button" data-source-tab="smb" aria-selected="false">SMB</button><button type="button" data-source-tab="radio" aria-selected="false">Online Radio</button></nav><section id="source-plex" class="settings-panel"></section><section id="source-smb" class="settings-panel" hidden></section><section id="source-radio" class="settings-panel" hidden></section></section></div>';
+dialog.innerHTML='<header class="settings-header"><h2 id="settingsTitle">Settings</h2><button type="button" id="settingsClose" aria-label="Close settings">Close</button></header><nav class="settings-tabs" aria-label="Settings sections"><button type="button" data-settings-tab="app" aria-selected="true">App Settings</button><button type="button" data-settings-tab="sources" aria-selected="false">Source Settings</button></nav><div class="settings-scroll"><section id="appSettingsPanel" class="settings-panel"></section><section id="sourceSettingsPanel" class="settings-panel" hidden><nav class="settings-tabs" aria-label="Source settings"><button type="button" data-source-tab="plex" aria-selected="true">Plex</button><button type="button" data-source-tab="jellyfin" aria-selected="false">Jellyfin</button><button type="button" data-source-tab="emby" aria-selected="false">Emby</button><button type="button" data-source-tab="smb" aria-selected="false">SMB</button><button type="button" data-source-tab="radio" aria-selected="false">Online Radio</button></nav><section id="source-plex" class="settings-panel"></section><section id="source-jellyfin" class="settings-panel" hidden></section><section id="source-emby" class="settings-panel" hidden></section><section id="source-smb" class="settings-panel" hidden></section><section id="source-radio" class="settings-panel" hidden></section></section></div>';
 document.body.appendChild(dialog);
-const q=id=>document.getElementById(id);let loaded={};let fieldCounter=0;
+const q=id=>document.getElementById(id);let loaded={};let fieldCounter=0;let activeAppTab="Playback";
 const readPath=(obj,path)=>path.split('.').reduce((v,key)=>v?.[key],obj);
 function writePath(obj,path,value){const keys=path.split('.');let node=obj;keys.slice(0,-1).forEach(key=>{node=node[key]||(node[key]={})});node[keys.at(-1)]=value}
 function el(tag,text,cls){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(cls)node.className=cls;return node}
@@ -46,20 +46,27 @@ function inputField(parent,definition,value){
 function fieldValue(input){return input.type==='checkbox'?(input.dataset.invert==='true'?!input.checked:input.checked):(input.type==='number'||input.dataset.numeric==='true')?Number(input.value):input.value}
 async function work(buttonNode,message,fn){buttonNode.disabled=true;status(message,'Testing…');try{const result=await fn();status(message,result.message||'Connection successful.')}catch(error){status(message,error.message,true)}finally{buttonNode.disabled=false}}
 function selectSettings(tab){dialog.querySelectorAll('[data-settings-tab]').forEach(b=>b.setAttribute('aria-selected',b.dataset.settingsTab===tab));q('appSettingsPanel').hidden=tab!=='app';q('sourceSettingsPanel').hidden=tab!=='sources';if(tab==='app')loadApp();else loadSource('plex')}
-function selectSource(tab){dialog.querySelectorAll('[data-source-tab]').forEach(b=>b.setAttribute('aria-selected',b.dataset.sourceTab===tab));['plex','smb','radio'].forEach(name=>q('source-'+name).hidden=name!==tab);loadSource(tab)}
+function selectSource(tab){dialog.querySelectorAll('[data-source-tab]').forEach(b=>b.setAttribute('aria-selected',b.dataset.sourceTab===tab));['plex','jellyfin','emby','smb','radio'].forEach(name=>q('source-'+name).hidden=name!==tab);loadSource(tab)}
 dialog.querySelectorAll('[data-settings-tab]').forEach(b=>b.onclick=()=>selectSettings(b.dataset.settingsTab));dialog.querySelectorAll('[data-source-tab]').forEach(b=>b.onclick=()=>selectSource(b.dataset.sourceTab));
-q('settingsOpen').onclick=()=>{loaded={};q('appSettingsPanel').replaceChildren();['plex','smb','radio'].forEach(name=>q('source-'+name).replaceChildren());dialog.showModal();selectSource('plex');selectSettings('app')};q('settingsClose').onclick=()=>dialog.close();
+q('settingsOpen').onclick=()=>{loaded={};q('appSettingsPanel').replaceChildren();['plex','jellyfin','emby','smb','radio'].forEach(name=>q('source-'+name).replaceChildren());dialog.showModal();selectSource('plex');selectSettings('app')};q('settingsClose').onclick=()=>dialog.close();
 async function loadApp(force=false){
  if(loaded.app&&!force)return;loaded.app=true;const panel=q('appSettingsPanel');panel.replaceChildren(el('p','Loading app settings…','settings-note'));
  try{
  const data=await api('/api/settings/app');panel.replaceChildren(el('p','Changes use the same configuration as the MiSTer app. Web Remote enabled/port changes require restarting Hi-Fi.','settings-note'));
  const form=el('form');panel.appendChild(form);const groups=new Map(),inputs=new Map();let initial=data.config;
+ const categoryNames=['Playback','Appearance','Controls','System','Experimental'];
+ const categoryNav=el('nav',undefined,'settings-tabs');categoryNav.setAttribute('role','tablist');categoryNav.setAttribute('aria-label','App settings categories');form.appendChild(categoryNav);
+ const categoryPanels=new Map(),categoryButtons=new Map();
+ function chooseCategory(name,focus=false){activeAppTab=name;categoryPanels.forEach((node,key)=>node.hidden=key!==name);categoryButtons.forEach((node,key)=>{node.setAttribute('aria-selected',key===name);node.tabIndex=key===name?0:-1});if(focus)categoryButtons.get(name).focus()}
+ for(const name of categoryNames){const id=name.toLowerCase(),page=el('section');page.id='app-category-'+id;page.setAttribute('role','tabpanel');page.setAttribute('aria-labelledby','app-tab-'+id);categoryPanels.set(name,page);const b=button(name,()=>chooseCategory(name));b.id='app-tab-'+id;b.setAttribute('role','tab');b.setAttribute('aria-controls',page.id);b.onkeydown=e=>{let index=categoryNames.indexOf(name);if(e.key==='ArrowLeft')index=(index+4)%5;else if(e.key==='ArrowRight')index=(index+1)%5;else if(e.key==='Home')index=0;else if(e.key==='End')index=4;else return;e.preventDefault();chooseCategory(categoryNames[index],true)};categoryNav.appendChild(b);categoryButtons.set(name,b);form.appendChild(page)}
+ function category(field){if(['fps_target','gba_music_enabled','gapless_playback'].includes(field.path))return 'Experimental';if(['confirm_on_exit','show_web_address','web_remote_enabled','web_remote_port'].includes(field.path))return 'System';if(field.group==='Display')return 'Appearance';if(field.group==='Controls and navigation')return 'Controls';return 'Playback'}
  for(const field of data.fields){
-  let grid=groups.get(field.group);if(!grid){const group=el('fieldset',undefined,'setting-group');group.appendChild(el('legend',field.group));grid=el('div',undefined,'settings-grid');group.appendChild(grid);form.appendChild(group);groups.set(field.group,grid)}
+  const section=category(field),groupKey=section+':'+field.group;let grid=groups.get(groupKey);if(!grid){const group=el('fieldset',undefined,'setting-group');group.appendChild(el('legend',field.group));grid=el('div',undefined,'settings-grid');group.appendChild(grid);categoryPanels.get(section).appendChild(group);groups.set(groupKey,grid)}
   const input=inputField(grid,field,readPath(initial,field.path));inputs.set(field.path,input);
  }
  const art=inputs.get('hide_album_art'),autoArt=inputs.get('auto_hide_missing_art');const artState=()=>{autoArt.disabled=!art.checked};art.onchange=artState;artState();
- const eqGrid=groups.get('Equalizer');const presetSelect=inputField(eqGrid,{type:'select',label:'Preset',options:[{value:'custom',label:'Custom'},...data.presets.map((p,i)=>({value:String(i),label:p.Name}))]},'custom');
+ chooseCategory(categoryNames.includes(activeAppTab)?activeAppTab:'Playback');
+ const eqGrid=groups.get('Playback:Equalizer');const presetSelect=inputField(eqGrid,{type:'select',label:'Preset',options:[{value:'custom',label:'Custom'},...data.presets.map((p,i)=>({value:String(i),label:p.Name}))]},'custom');
  function syncPreset(){const match=data.presets.findIndex(p=>['Bass','LowMid','Mid','HighMid','Treble'].every(k=>Number(inputs.get('eq.'+k).value)===p[k]));presetSelect.value=match<0?'custom':String(match)}
  presetSelect.onchange=()=>{if(presetSelect.value==='custom')return;const preset=data.presets[Number(presetSelect.value)];['Bass','LowMid','Mid','HighMid','Treble'].forEach(k=>inputs.get('eq.'+k).value=preset[k]);inputs.get('eq.enabled').checked=true};['Bass','LowMid','Mid','HighMid','Treble'].forEach(k=>inputs.get('eq.'+k).addEventListener('input',syncPreset));syncPreset();
  const eqActions=el('div',undefined,'settings-actions');eqActions.appendChild(button('Reset flat',()=>{['Bass','LowMid','Mid','HighMid','Treble'].forEach(k=>inputs.get('eq.'+k).value=0);syncPreset()}));eqGrid.parentNode.appendChild(eqActions);
@@ -67,13 +74,13 @@ async function loadApp(force=false){
  form.onsubmit=async event=>{event.preventDefault();if(!form.reportValidity())return;const patch={};
  for(const [path,input]of inputs){const value=fieldValue(input);if(input.type==='password'&&value==='')continue;if(value!==readPath(initial,path))writePath(patch,path,value)}
  if(!Object.keys(patch).length){status(message,'No changes to save.');return}
- save.disabled=true;try{const result=await post('/api/settings/app',patch);initial=result.config;for(const[path,input]of inputs){if(input.type==='password')input.value=''}status(message,result.restart_required?'Saved. Restart Hi-Fi to apply the Web Remote changes.':'App settings saved and applied.')}catch(error){status(message,error.message,true)}finally{save.disabled=false}};
+ save.disabled=true;try{const result=await post('/api/settings/app',patch);initial=result.config;for(const[path,input]of inputs){if(input.type==='password')input.value=''}status(message,result.restart_required?'Saved. Restart Hi-Fi to apply the Web Remote changes.':'App settings saved and applied.');if(Object.hasOwn(patch,'gba_music_enabled')){await sources();if(!result.config.gba_music_enabled&&currentSource==='gba'){currentSource='';currentPath='';$('path').textContent='';$('list').replaceChildren(el('div','GBA Music is disabled. Select another source.','empty'))}}}catch(error){status(message,error.message,true)}finally{save.disabled=false}};
  }catch(error){loaded.app=false;panel.replaceChildren(el('p',error.message,'settings-status error'),button('Retry',()=>loadApp(true)))}
 }
-async function refreshSources(){await sources();if(currentSource==='radio'||currentSource==='plex'){await browse(currentPath)}else if(currentSource.startsWith('smb:')){currentSource='';currentPath='';$('list').replaceChildren(el('div','Source settings saved. Select a source to browse.','empty'))}}
+async function refreshSources(){await sources();if(currentSource==='radio'||currentSource==='plex'||currentSource==='jellyfin'||currentSource==='emby'){await browse(currentPath)}else if(currentSource.startsWith('smb:')){currentSource='';currentPath='';$('list').replaceChildren(el('div','Source settings saved. Select a source to browse.','empty'))}}
 async function loadSource(kind,force=false){
  if(loaded[kind]&&!force)return;loaded[kind]=true;const panel=q('source-'+kind);panel.replaceChildren(el('p','Loading source settings…','settings-note'));
- try{if(kind==='plex')await plexForm(panel);else await collectionForm(panel,kind)}catch(error){loaded[kind]=false;panel.replaceChildren(el('p',error.message,'settings-status error'),button('Retry',()=>loadSource(kind,true)))}
+ try{if(kind==='plex')await plexForm(panel);else if(kind==='jellyfin'||kind==='emby')await jellyfinForm(panel,kind);else await collectionForm(panel,kind)}catch(error){loaded[kind]=false;panel.replaceChildren(el('p',error.message,'settings-status error'),button('Retry',()=>loadSource(kind,true)))}
 }
 async function plexForm(panel){
  const data=await api('/api/plex/config'),c=data.config;panel.replaceChildren(el('h3','Plex'));
@@ -83,12 +90,43 @@ async function plexForm(panel){
  {path:'server',label:'Server URL',type:'url',required:true},{path:'token',label:'X-Plex-Token',type:'password',placeholder:data.configured?'Saved token — leave blank to keep':'Enter your X-Plex-Token'},
  {path:'library',label:'Music library ID (optional)',type:'text',help:'Numeric section ID, not the library name.'},
  {path:'max_track_mb',label:'Maximum track size (MB)',type:'number',min:1,max:1024,step:1},
- {path:'scrobbling',label:'Scrobbling',type:'select',options:[{value:'plex',label:'Plex (external Last.fm scrobbler)'},{value:'lastfm',label:'Hi-Fi Last.fm'},{value:'none',label:'None'}]},
+ {path:'scrobbling',label:'Scrobbling',type:'select',options:[{value:'plex',label:'Plex (external Last.fm scrobbler)'},{value:'lastfm',label:'Hi-Fi Last.fm'},{value:'listenbrainz',label:'Hi-Fi ListenBrainz'},{value:'both',label:'Hi-Fi Last.fm + ListenBrainz'},{value:'none',label:'None'}]},
  {path:'insecure',label:'Allow self-signed HTTPS certificate',type:'checkbox'}]){inputs[field.path]=inputField(grid,field,c[field.path])}
  const read=()=>Object.fromEntries(Object.entries(inputs).map(([key,input])=>[key,fieldValue(input)]));
  const actions=el('div',undefined,'settings-actions'),message=statusNode(form);const save=el('button','Save Plex settings','primary');save.type='submit';
  const test=button('Test connection',()=>{if(form.reportValidity())work(test,message,()=>post('/api/settings/test',{kind:'plex',plex:read()}))});actions.append(save,test,button('Reload',()=>loadSource('plex',true)));form.insertBefore(actions,message);
  form.onsubmit=async event=>{event.preventDefault();if(!form.reportValidity())return;save.disabled=true;try{await post('/api/plex/config',read());inputs.token.value='';inputs.token.placeholder='Saved token — leave blank to keep';status(message,'Plex settings saved.');await refreshSources()}catch(error){status(message,error.message,true)}finally{save.disabled=false}};
+}
+async function jellyfinForm(panel,kind='jellyfin'){
+ const emby=kind==='emby',N=emby?'Emby':'Jellyfin',data=await api('/api/'+kind+'/config'),c=data.config;panel.replaceChildren(el('h3',N));
+ panel.appendChild(el('p',(emby?'Enter the server URL and save it, then sign in with your Emby user name and password: the password is not stored, only a token. ':'Enter the server URL and save it, then sign in with Quick Connect: no password is stored, only a token. ')+'Leave the library ID blank to use the first music library. '+N+' appears in the sources once it is set up.','settings-note'));
+ const form=el('form'),grid=el('div',undefined,'settings-grid');form.appendChild(grid);panel.appendChild(form);
+ const inputs={};for(const field of[
+ {path:'server',label:'Server URL',type:'url',required:true,placeholder:'http://192.168.1.10:8096'},
+ {path:'library',label:'Music library ID (optional)',type:'text',help:'The library id from '+N+', not its name.'},
+ {path:'max_track_mb',label:'Maximum track size (MB)',type:'number',min:1,max:1024,step:1},
+ {path:'scrobbling',label:'Scrobbling',type:'select',options:[{value:'server',label:N+' (it keeps the history)'},{value:'lastfm',label:'Hi-Fi Last.fm'},{value:'listenbrainz',label:'Hi-Fi ListenBrainz'},{value:'both',label:'Hi-Fi Last.fm + ListenBrainz'},{value:'none',label:'None'}]},
+ {path:'insecure',label:'Allow self-signed HTTPS certificate',type:'checkbox'}]){inputs[field.path]=inputField(grid,field,c[field.path])}
+ const read=()=>Object.fromEntries(Object.entries(inputs).map(([key,input])=>[key,fieldValue(input)]));
+ const actions=el('div',undefined,'settings-actions'),message=statusNode(form);const save=el('button','Save '+N+' settings','primary');save.type='submit';
+ const test=button('Test connection',()=>{if(form.reportValidity())work(test,message,()=>post('/api/settings/test',emby?{kind:'emby',emby:read()}:{kind:'jellyfin',jellyfin:read()}))});
+ actions.append(save,test,button('Reload',()=>loadSource(kind,true)));form.insertBefore(actions,message);
+ form.onsubmit=async event=>{event.preventDefault();if(!form.reportValidity())return;save.disabled=true;try{const r=await post('/api/'+kind+'/config',read());status(message,r.signed_in?N+' settings saved.':'Settings saved. Now sign in'+(emby?'.':' with Quick Connect.'));await refreshSources();if(r.signed_in!==data.signed_in)await loadSource(kind,true)}catch(error){status(message,error.message,true)}finally{save.disabled=false}};
+ const box=el('div',undefined,'source-card');box.appendChild(el('h4',data.signed_in?'Signed in':'Not signed in'));
+ const login=el('p','','settings-status');box.appendChild(login);
+ let btn;
+ if(emby){
+  const ui=document.createElement('input');ui.type='text';ui.placeholder='User name';ui.autocomplete='username';
+  const pi=document.createElement('input');pi.type='password';pi.placeholder='Password';pi.autocomplete='current-password';
+  box.append(ui,pi);
+  btn=button(data.signed_in?'Sign in again':'Sign in',async()=>{btn.disabled=true;try{await post('/api/emby/signin',{user:ui.value,password:pi.value});pi.value='';login.className='settings-status success';login.textContent='Signed in.';await refreshSources();await loadSource('emby',true)}catch(error){login.className='settings-status error';login.textContent=error.message}finally{btn.disabled=false}});
+ }else{
+  btn=button(data.signed_in?'Sign in again':'Sign in with Quick Connect',async()=>{
+  btn.disabled=true;try{const r=await post('/api/jellyfin/quickconnect',{action:'start'});login.className='settings-status';login.textContent='In Jellyfin open your profile, Quick Connect, and enter the code: '+r.code;
+   const poll=async()=>{const s=await api('/api/jellyfin/quickconnect');if(s.state==='pending'){setTimeout(poll,2000)}else if(s.state==='signed_in'){login.className='settings-status success';login.textContent='Signed in.';btn.disabled=false;await refreshSources();await loadSource('jellyfin',true)}else{login.className='settings-status error';login.textContent=s.message||'Sign-in failed.';btn.disabled=false}};setTimeout(poll,2000)
+  }catch(error){login.className='settings-status error';login.textContent=error.message;btn.disabled=false}});
+ }
+ box.appendChild(btn);panel.appendChild(box);
 }
 async function collectionForm(panel,kind){
  const isSMB=kind==='smb',title=isSMB?'SMB shares':'Online Radio',arrayKey=isSMB?'shares':'stations';const data=await api('/api/settings/'+kind);let entries=data[arrayKey]||[];
